@@ -16,3 +16,7 @@ tmp/
 wandb/
 outputs/
 models/
+
+# virtualenv and slurm jobs
+.jaxmarl_3106_test/
+slurm/
