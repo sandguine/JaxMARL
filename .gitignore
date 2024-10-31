@@ -17,6 +17,9 @@ wandb/
 outputs/
 models/
 
-# virtualenv and slurm jobs
+# virtualenv, installation, and slurm jobs
 .jaxmarl_3106_test/
 slurm/
+tests/slurm/
+requirements.txt
+requirements.in
