@@ -18,7 +18,7 @@ outputs/
 models/
 
 # virtualenv, installation, and slurm jobs
-.jaxmarl_3106_test/
+.venv/
 slurm/
 tests/slurm/
 requirements.txt

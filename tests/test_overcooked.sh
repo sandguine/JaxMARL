@@ -8,4 +8,4 @@
 #SBATCH --qos=default
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.9
-srun pytest overcooked/test_overcooked_unit_test.py -s
+srun pytest tests/overcooked/test_overcooked_unit_test.py -s

@@ -14,14 +14,15 @@ print("Environment created:", env)
 @pytest.mark.parametrize("steps", [10])
 def test_random_rollout(steps):
 
-    rng = jax.random.PRNGKey(0)
-    rng, rng_reset = jax.random.split(rng)
+    # Set random seed for reproducibility
+    rng = jax.random.PRNGKey(0) 
     print("Random keys generated:", rng, rng_reset)
 
     # Reset the environment and verify initial state is returned
+    rng, rng_reset = jax.random.split(rng)
     _, state = env.reset(rng_reset)
     assert state is not None, "Failed to reset environment: state is None"
-    print("Initial state after reset:", state)
+    print("Initial state:", state)
 
     # Perform a series of steps with random actions
     for step in range(steps):
@@ -44,6 +45,8 @@ def test_random_rollout(steps):
         assert state is not None, "State is None after step"
         assert isinstance(reward, dict), "Reward is not a dictionary"
         assert isinstance(dones, dict), "Dones is not a dictionary"
+
+        # Ensure all done vlues are boolean-compatible
         assert all(isinstance(done, bool) for done in dones.values()), f"Dones contains non-boolean values: {dones}"
 
         # Check if the environment has terminated for all agents
