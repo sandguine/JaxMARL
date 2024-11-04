@@ -44,7 +44,7 @@ def test_random_rollout(steps):
         assert state is not None, "State is None after step"
         assert isinstance(reward, dict), "Reward is not a dictionary"
         assert isinstance(dones, dict), "Dones is not a dictionary"
-        assert all(isinstance(done, bool) for done in dones.values()), "Dones should contain only boolean values"
+        assert all(isinstance(done, bool) for done in dones.values()), f"Dones contains non-boolean values: {dones}"
 
         # Check if the environment has terminated for all agents
         if dones["__all__"]:
