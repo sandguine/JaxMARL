@@ -8,4 +8,4 @@
 #SBATCH --qos=default
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.9
-srun python test_jaxmarl_api.py
+srun python tests/test_jaxmarl_api.py

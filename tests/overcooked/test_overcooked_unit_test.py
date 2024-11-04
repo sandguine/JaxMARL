@@ -16,10 +16,10 @@ def test_random_rollout(steps):
 
     # Set random seed for reproducibility
     rng = jax.random.PRNGKey(0) 
-    print("Random keys generated:", rng, rng_reset)
-
-    # Reset the environment and verify initial state is returned
     rng, rng_reset = jax.random.split(rng)
+    print("Random keys generated:", rng, rng_reset)
+    
+    # Reset the environment and verify initial state is returned
     _, state = env.reset(rng_reset)
     assert state is not None, "Failed to reset environment: state is None"
     print("Initial state:", state)
@@ -46,8 +46,9 @@ def test_random_rollout(steps):
         assert isinstance(reward, dict), "Reward is not a dictionary"
         assert isinstance(dones, dict), "Dones is not a dictionary"
 
-        # Ensure all done vlues are boolean-compatible
-        assert all(isinstance(done, bool) for done in dones.values()), f"Dones contains non-boolean values: {dones}"
+        # Ensure all done values are boolean-compatible
+        assert all(isinstance(done, (bool, jnp.ndarray)) and done.dtype == jnp.bool_ for done in dones.values()), f"Dones contains non-boolean values: {dones}"
+
 
         # Check if the environment has terminated for all agents
         if dones["__all__"]:
