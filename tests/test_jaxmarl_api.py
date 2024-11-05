@@ -46,7 +46,7 @@ def test_auto_reset_to_specific_state():
     print("Next state after auto-reset:", next_state)
     print("Dones after auto-reset:", dones)
     assert dones["__all__"]
-    jax.tree_map(_test_leaf, state2, next_state)
+    jax.tree_util.tree_map(_test_leaf, state2, next_state)
 
 print("JAX devices:", jax.devices())
 print("Ran test_jaxmarl_api.py")

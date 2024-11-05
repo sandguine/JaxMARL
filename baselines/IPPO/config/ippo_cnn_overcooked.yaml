@@ -23,4 +23,4 @@
 # WandB Params
 "ENTITY": ""
 "PROJECT": ""
-"WANDB_MODE" : "disabled"
+"WANDB_MODE" : "online"

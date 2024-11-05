@@ -121,8 +121,8 @@ def obs_to_act(obs, dones, params=params):
     obs = jax.tree_util.tree_map(_preprocess_obs, obs, agents_one_hot)
 
     # add a dummy temporal dimension
-    obs_   = jax.tree_map(lambda x: x[np.newaxis, np.newaxis, :], obs) # add also a dummy batch dim to obs
-    dones_ = jax.tree_map(lambda x: x[np.newaxis, :], dones)
+    obs_   = jax.tree_util.tree_map(lambda x: x[np.newaxis, np.newaxis, :], obs) # add also a dummy batch dim to obs
+    dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], dones)
 
     # pass in one with homogeneous pass
     hstate = ScannedRNN.initialize_carry(agent_hidden_dim, len(env_jax.agents))
@@ -184,7 +184,7 @@ for e in tqdm.tqdm(range(num_ep)):
         acts = obs_to_act(obs_jax, done_jax)
         #print('acts', acts)
         obs_jax, state, rew_jax, done_jax, _ = env_jax.step(key_s, state, acts)
-        done_jax = jax.tree_map(lambda x: x[None], done_jax)
+        done_jax = jax.tree_util.tree_map(lambda x: x[None], done_jax)
 
         rew_batch = np.array([rew_jax[a] for a in env_jax.agents])
         rew_tallys_jax[j] = rew_batch
