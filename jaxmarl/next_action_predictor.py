@@ -16,9 +16,9 @@ class ActionPredictor(nn.Module):
         x = nn.Dense(self.num_actions)(x)
         return nn.softmax(x)
 
-def create_train_state(rng, num_actions):
+def create_train_state(rng, num_actions, input_shape):
     model = ActionPredictor(num_actions)
-    params = model.init(rng, jnp.ones([1, 10]))  # Assuming input features are of size 10
+    params = model.init(rng, jnp.ones(input_shape))  # Update input shape
     tx = optax.adam(learning_rate=0.001)
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
