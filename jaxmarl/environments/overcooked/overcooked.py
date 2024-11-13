@@ -365,6 +365,9 @@ class Overcooked(MultiAgentEnv):
         is_move_action = jnp.logical_and(action != Actions.stay, action != Actions.interact)
         is_move_action_transposed = jnp.expand_dims(is_move_action, 0).transpose()  # Necessary to broadcast correctly
 
+        # Reshape is_move_action_transposed to be compatible
+        is_move_action_transposed = is_move_action_transposed.reshape((..., 1))  # exact shape depends on your setup
+
         fwd_pos = jnp.minimum(
             jnp.maximum(state.agent_pos + is_move_action_transposed * DIR_TO_VEC[jnp.minimum(action, 3)] \
                         + ~is_move_action_transposed * state.agent_dir, 0),

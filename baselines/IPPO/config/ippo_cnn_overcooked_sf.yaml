@@ -1,4 +1,6 @@
 "LR": 0.0005
+"FEATURE_LR": 0.0001
+"SF_LR": 0.0001
 "NUM_ENVS": 64
 "NUM_STEPS": 256
 "TOTAL_TIMESTEPS": 5e6
@@ -13,17 +15,19 @@
 "ACTIVATION": "relu"
 "ENV_NAME": "overcooked"
 "REW_SHAPING_HORIZON": 2.5e6 # for how many timesteps add a shaping reward
-"ENV_KWARGS": 
-  "layout" : "counter_circuit"
+
+# Successor Features settings
+"USE_SF": true
+"FEATURE_DIM": 64
+"SF_COEF": 0.5
+
+"ENV_KWARGS":
+  "layout": "counter_circuit"
 "ANNEAL_LR": True
 "SEED": 30
 "NUM_SEEDS": 1
 "TUNE": False
 
 # WandB Params
-"ENTITY": ""
-"PROJECT": ""
-"WANDB_MODE" : "online"
-
-# Flag for using successor features
-"USE_SUCCESSOR_FEATURES": true
+"PROJECT": "sf-ippo"
+"WANDB_MODE": "online"
