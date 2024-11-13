@@ -405,6 +405,9 @@ def make_train(config):
 def train(config):
     """Main training loop"""
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    if config["USE_SF"]:
+        env = SRWrapper(env)
+    env = LogWrapper(env)
     
     # Initialize random key
     rng = jax.random.PRNGKey(config["SEED"])

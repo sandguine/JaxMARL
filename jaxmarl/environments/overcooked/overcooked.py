@@ -361,18 +361,20 @@ class Overcooked(MultiAgentEnv):
             self, key: chex.PRNGKey, state: State, action: chex.Array,
     ) -> Tuple[State, float]:
 
-        # Update agent position (forward action)
-        is_move_action = jnp.logical_and(action != Actions.stay, action != Actions.interact)
-        is_move_action_transposed = jnp.expand_dims(is_move_action, 0).transpose()  # Necessary to broadcast correctly
+        # Reshape is_move_action to match the expected dimensions
+        is_move_action = (action < 4).astype(jnp.int32)  # Shape: (2, 40)
+        is_move_action_transposed = is_move_action.transpose()  # Shape: (40, 2)
+        is_move_action_transposed = is_move_action_transposed[..., None]  # Shape: (40, 2, 1)
 
-        # Reshape is_move_action_transposed to be compatible
-        is_move_action_transposed = is_move_action_transposed.reshape((..., 1))  # exact shape depends on your setup
+        # Get direction vectors for movement actions
+        move_directions = DIR_TO_VEC[jnp.minimum(action, 3)]  # Shape: (2, 40, 2)
+        
+        # Compute new positions ensuring compatible broadcasting
+        movement = jnp.einsum('ijk,jik->jik', is_move_action_transposed, move_directions)
+        new_pos = state.agent_pos + movement
 
-        fwd_pos = jnp.minimum(
-            jnp.maximum(state.agent_pos + is_move_action_transposed * DIR_TO_VEC[jnp.minimum(action, 3)] \
-                        + ~is_move_action_transposed * state.agent_dir, 0),
-            jnp.array((self.width - 1, self.height - 1), dtype=jnp.uint32)
-        )
+        # Apply maximum to keep within bounds
+        fwd_pos = jnp.maximum(new_pos, jnp.zeros_like(new_pos))
 
         # Can't go past wall or goal
         def _wall_or_goal(fwd_position, wall_map, goal_pos):
