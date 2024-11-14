@@ -111,7 +111,7 @@ def get_rollout(params, config):
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = ActionObservableWrapper(env)
 
-    network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+    network = ActorCritic(env.action_space("agent_0").n, activation=config["ACTIVATION"])
     key = jax.random.PRNGKey(0)
     key, key_r, key_a = jax.random.split(key, 3)
 
@@ -182,7 +182,7 @@ def make_train(config):
     def train(rng):
 
         # INIT NETWORK
-        network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+        network = ActorCritic(env.action_space("agent_0").n, activation=config["ACTIVATION"])
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros((1, *env.observation_space().shape))
 
