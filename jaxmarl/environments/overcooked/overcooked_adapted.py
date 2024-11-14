@@ -357,110 +357,98 @@ class Overcooked(MultiAgentEnv):
 
         return {"agent_0" : alice_obs, "agent_1" : bob_obs}
 
-    def step_agents(
-            self, key: chex.PRNGKey, state: State, action: chex.Array,
-    ) -> Tuple[State, float]:
-
-        # Update agent position (forward action)
-        is_move_action = jnp.logical_and(action != Actions.stay, action != Actions.interact)
-        is_move_action_transposed = jnp.expand_dims(is_move_action, 0).transpose()  # Necessary to broadcast correctly
-
-        fwd_pos = jnp.minimum(
-            jnp.maximum(state.agent_pos + is_move_action_transposed * DIR_TO_VEC[jnp.minimum(action, 3)] \
-                        + ~is_move_action_transposed * state.agent_dir, 0),
-            jnp.array((self.width - 1, self.height - 1), dtype=jnp.uint32)
-        )
-
-        # Can't go past wall or goal
-        def _wall_or_goal(fwd_position, wall_map, goal_pos):
-            fwd_wall = wall_map.at[fwd_position[1], fwd_position[0]].get()
-            goal_collision = lambda pos, goal : jnp.logical_and(pos[0] == goal[0], pos[1] == goal[1])
-            fwd_goal = jax.vmap(goal_collision, in_axes=(None, 0))(fwd_position, goal_pos)
-            # fwd_goal = jnp.logical_and(fwd_position[0] == goal_pos[0], fwd_position[1] == goal_pos[1])
-            fwd_goal = jnp.any(fwd_goal)
-            return fwd_wall, fwd_goal
-
-        fwd_pos_has_wall, fwd_pos_has_goal = jax.vmap(_wall_or_goal, in_axes=(0, None, None))(fwd_pos, state.wall_map, state.goal_pos)
-
-        fwd_pos_blocked = jnp.logical_or(fwd_pos_has_wall, fwd_pos_has_goal).reshape((self.num_agents, 1))
-
-        bounced = jnp.logical_or(fwd_pos_blocked, ~is_move_action_transposed)
-
+    def step_agents(self, key: chex.PRNGKey, state: State, action: chex.Array):
+        # Identify move actions (stay=4, interact=5)
+        is_move_action = (action < 4).astype(jnp.int32)  # Shape: (2, 40)
+        
+        # Calculate forward positions
+        movement = is_move_action[..., None] * DIR_TO_VEC[jnp.minimum(action, 3)]  # Shape: (2, 40, 2)
+        
+        # Expand agent_pos to match batch dimension
+        agent_pos_expanded = state.agent_pos[:, None, :]  # Shape: (2, 1, 2) -> will broadcast to (2, 40, 2)
+        
+        # Now the shapes are compatible for broadcasting
+        fwd_pos = jnp.maximum(agent_pos_expanded + movement, jnp.zeros_like(agent_pos_expanded))  # Shape: (2, 40, 2)
+        
+        # Check for walls directly from wall_map
+        fwd_pos_has_wall = state.wall_map.at[fwd_pos[..., 1], fwd_pos[..., 0]].get()  # Shape: (2, 40)
+        
+        # Add dimension without reshape
+        fwd_pos_blocked = fwd_pos_has_wall[..., None]  # Shape: (2, 40, 1)
+        
+        # Take first batch entry since they're all the same after wall checks
+        fwd_pos = fwd_pos[:, 0, :]  # Shape: (2, 2)
+        fwd_pos_blocked = fwd_pos_blocked[:, 0]  # Shape: (2, 1)
+        
         # Agents can't overlap
-        # Hardcoded for 2 agents (call them Alice and Bob)
-        agent_pos_prev = jnp.array(state.agent_pos)
-        fwd_pos = (bounced * state.agent_pos + (~bounced) * fwd_pos).astype(jnp.uint32)
+        agent_pos_prev = jnp.array(state.agent_pos)  # Shape: (2, 2)
+        fwd_pos = (fwd_pos_blocked * state.agent_pos + (~fwd_pos_blocked) * fwd_pos).astype(jnp.uint32)  # Shape: (2, 2)
         collision = jnp.all(fwd_pos[0] == fwd_pos[1])
-
-        # No collision = No movement. This matches original Overcooked env.
+        
+        # Cases (bounced == hit wall/goal and stayed in place)
+        neither_bounced = (~fwd_pos_blocked).all()
+        only_alice_bounced = jnp.logical_and(fwd_pos_blocked[0], ~fwd_pos_blocked[1])
+        only_bob_bounced = jnp.logical_and(~fwd_pos_blocked[0], fwd_pos_blocked[1])
+        
         alice_pos = jnp.where(
-            collision,
+            collision * only_bob_bounced,
             state.agent_pos[0],                     # collision and Bob bounced
             fwd_pos[0],
         )
+        
         bob_pos = jnp.where(
-            collision,
+            collision * only_alice_bounced,
             state.agent_pos[1],                     # collision and Alice bounced
             fwd_pos[1],
         )
-
-        # Prevent swapping places (i.e. passing through each other)
+        
+        # Random collision resolution
+        key, rng_coll = jax.random.split(key)
+        alice_wins = jax.random.choice(rng_coll, 2)
+        
+        alice_pos = jnp.where(
+            collision * neither_bounced * (1-alice_wins),
+            state.agent_pos[0],
+            alice_pos
+        )
+        
+        bob_pos = jnp.where(
+            collision * neither_bounced * alice_wins,
+            state.agent_pos[1],
+            bob_pos
+        )
+        
+        # Prevent swapping places
         swap_places = jnp.logical_and(
             jnp.all(fwd_pos[0] == state.agent_pos[1]),
             jnp.all(fwd_pos[1] == state.agent_pos[0]),
         )
+        
         alice_pos = jnp.where(
             ~collision * swap_places,
             state.agent_pos[0],
             alice_pos
         )
+        
         bob_pos = jnp.where(
             ~collision * swap_places,
             state.agent_pos[1],
             bob_pos
         )
+        
+        # Update final positions
+        agent_pos = jnp.stack([alice_pos, bob_pos])  # Shape: (2, 2)
+        
+        # Update agent direction (left_turn or right_turn action)
+        agent_dir_offset = \
+            0 \
+            + (action == Actions.left) * (-1) \
+            + (action == Actions.right) * 1
 
-        fwd_pos = fwd_pos.at[0].set(alice_pos)
-        fwd_pos = fwd_pos.at[1].set(bob_pos)
-        agent_pos = fwd_pos.astype(jnp.uint32)
-
-        # Update agent direction
-        agent_dir_idx = ~is_move_action * state.agent_dir_idx + is_move_action * action
+        agent_dir_idx = (state.agent_dir_idx + agent_dir_offset) % 4
         agent_dir = DIR_TO_VEC[agent_dir_idx]
 
-        # Handle interacts. Agent 1 first, agent 2 second, no collision handling.
-        # This matches the original Overcooked
-        fwd_pos = state.agent_pos + state.agent_dir
-        maze_map = state.maze_map
-        is_interact_action = (action == Actions.interact)
-
-        # Compute the effect of interact first, then apply it if needed
-        candidate_maze_map, alice_inv, alice_reward, alice_shaped_reward = self.process_interact(maze_map, state.wall_map, fwd_pos, state.agent_inv, 0)
-        alice_interact = is_interact_action[0]
-        bob_interact = is_interact_action[1]
-
-        maze_map = jax.lax.select(alice_interact,
-                              candidate_maze_map,
-                              maze_map)
-        alice_inv = jax.lax.select(alice_interact,
-                              alice_inv,
-                              state.agent_inv[0])
-        alice_reward = jax.lax.select(alice_interact, alice_reward, 0.)
-        alice_shaped_reward = jax.lax.select(alice_interact, alice_shaped_reward, 0.)
-
-        candidate_maze_map, bob_inv, bob_reward, bob_shaped_reward = self.process_interact(maze_map, state.wall_map, fwd_pos, state.agent_inv, 1)
-        maze_map = jax.lax.select(bob_interact,
-                              candidate_maze_map,
-                              maze_map)
-        bob_inv = jax.lax.select(bob_interact,
-                              bob_inv,
-                              state.agent_inv[1])
-        bob_reward = jax.lax.select(bob_interact, bob_reward, 0.)
-        bob_shaped_reward = jax.lax.select(bob_interact, bob_shaped_reward, 0.)
-
-        agent_inv = jnp.array([alice_inv, bob_inv])
-
-        # Update agent component in maze_map
+        # # Update agent component in maze_map
         def _get_agent_updates(agent_dir_idx, agent_pos, agent_pos_prev, agent_idx):
             agent = jnp.array([OBJECT_TO_INDEX['agent'], COLOR_TO_INDEX['red']+agent_idx*2, agent_dir_idx], dtype=jnp.uint8)
             agent_x_prev, agent_y_prev = agent_pos_prev
@@ -475,7 +463,7 @@ class Overcooked(MultiAgentEnv):
         height = self.obs_shape[1]
         padding = (state.maze_map.shape[0] - height) // 2
 
-        maze_map = maze_map.at[padding + agent_y_prev, padding + agent_x_prev, :].set(empty)
+        maze_map = state.maze_map.at[padding + agent_y_prev, padding + agent_x_prev, :].set(empty)
         maze_map = maze_map.at[padding + agent_y, padding + agent_x, :].set(agent_vec)
 
         # Update pot cooking status

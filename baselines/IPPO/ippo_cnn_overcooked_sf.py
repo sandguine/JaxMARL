@@ -576,7 +576,7 @@ def get_rollout(training_state: Union[TrainingState, Any], config: dict):
             )
         else:
             pi, value = network.apply(
-                training_state,  # Use full params when not using SF
+                training_state.policy_state.params,
                 obs_batch
             )
         

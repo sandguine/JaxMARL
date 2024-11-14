@@ -29,5 +29,6 @@
 "TUNE": False
 
 # WandB Params
+"ENTITY": "sandily"
 "PROJECT": "sf-ippo"
 "WANDB_MODE": "online"
