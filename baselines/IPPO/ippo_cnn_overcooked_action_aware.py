@@ -251,93 +251,64 @@ def make_train(config):
                 print("Original observation shape:", {a: last_obs[a].shape for a in env.agents})
                 # Should show (64, 4, 5, 26) for each agent
 
-                # Ensure random keys are split correctly for each environment
-                rng, rng_step = jax.random.split(rng)
-                step_keys = jax.random.split(rng_step, config["NUM_ENVS"])  # Split for NUM_ENVS (64)
-            
-                # Augment observations with co-player's previous actions
-                augmented_obs = {
-                    agent: jnp.concatenate([
-                        last_obs[agent],  # Original obs: (NUM_ENVS, H, W, C)
-                        jnp.zeros((config["NUM_ENVS"], 4, 5, 1))  # Initialize with zeros for first step
-                    ], axis=-1)
-                    for agent in env.agents
-                }
-
-                # # Augment observations with co-player's previous actions
-                # augmented_obs = {
-                #     agent: jnp.concatenate([
-                #          # Reshape and broadcast co-player's action to match spatial dimensions
-                #         last_obs[agent],  # Original obs: (NUM_ENVS, H, W, C)
-                #         jnp.broadcast_to(
-                #             prev_actions[get_coplayer(agent)][:, None, None, :],  # (NUM_ENVS, 1, 1, 1)
-                #             (config["NUM_ENVS"], *last_obs[agent].shape[1:3], 1)  # (NUM_ENVS, H, W, 1)
-                #         )  # Broadcast action to match spatial dims
-                #     ], axis=-1)  # Final shape: (NUM_ENVS, H, W, C+1)
-                #     for agent in env.agents
-                # }
-                # print("Augmented observation shape:", {a: augmented_obs[a].shape for a in env.agents})
+                # Split RNG for various operations
+                rng, rng_act, rng_step = jax.random.split(rng, 3)
                 
-                # Stack observations for network input
-                obs_batch = jnp.concatenate([augmented_obs[a] for a in env.agents], axis=0)
+                # Stack observations for network input - keep original shape
+                obs_batch = jnp.stack([last_obs[a] for a in env.agents]).reshape(-1, *env.observation_space().shape)
                 print("Stacked observation shape:", obs_batch.shape)
                 
-                # Get actions from network
-                rng, _rng = jax.random.split(rng)
+                # Get actions from policy network
                 pi, value = network.apply(train_state.params, obs_batch)
-                action = pi.sample(seed=_rng)
+                action = pi.sample(seed=rng_act)
                 log_prob = pi.log_prob(action)
                 
-                # Convert to environment format
-                env_act = unbatchify(
-                    action, env.agents, config["NUM_ENVS"], env.num_agents
-                )
+                # Convert to environment format - this creates a dict with actions for each agent
+                env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
+                # Flatten actions for environment step
+                env_act = {k: v.flatten() for k, v in env_act.items()}
+                
+                # Create step keys for each environment
+                rng_steps = jax.random.split(rng_step, config["NUM_ENVS"])
 
-                # DEBUGGING: Print shapes before vmap
+                # DEBUGGING: Print shapes of env_state and env_act
                 print("env_state shape:", jax.tree_util.tree_map(lambda x: x.shape, env_state))
                 print("env_act shape:", {k: v.shape for k, v in env_act.items()})
                 print("step_keys shape:", step_keys.shape)
                 
-                # Step environment with properly shaped keys
-                next_obs, env_state, reward, done, info = jax.vmap(
+                # Step environment
+                obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0)
-                )(step_keys, env_state, env_act)
-
-                # Update augmented observations with actual actions for next timestep
-                augmented_next_obs = {
-                    agent: jnp.concatenate([
-                        next_obs[agent],  # Shape: (64, 4, 5, 26)
-                        jnp.broadcast_to(  # Broadcast action to match spatial dimensions
-                            env_act[get_coplayer(agent)][:, None, None, :],  # Shape: (64, 1, 1, 1)
-                            (config["NUM_ENVS"], 4, 5, 1)
-                        )
-                    ], axis=-1)
-                    for agent in env.agents
-                }
-
+                )(rng_steps, env_state, env_act)
+                
+                # Process rewards
                 shaped_reward = info.pop("shaped_reward")
-                current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
-                reward = jax.tree_util.tree_map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, shaped_reward)
-
-                info = jax.tree_util.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                current_timestep = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
+                reward = jax.tree_util.tree_map(
+                    lambda x, y: x + y * rew_shaping_anneal(current_timestep), 
+                    reward, 
+                    shaped_reward
+                )
+                
+                # Reshape info for batch processing
+                info = jax.tree_util.tree_map(
+                    lambda x: x.reshape((config["NUM_ACTORS"])), 
+                    info
+                )
+                
+                # Create transition object
                 transition = Transition(
-                    batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    action,
-                    value,
-                    batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    log_prob,
-                    obs_batch,
-                    info,
+                    done=batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    action=action,
+                    value=value,
+                    reward=batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    log_prob=log_prob,
+                    obs=obs_batch,
+                    info=info,
                 )
-
-                # Create new runner state
-                runner_state = RunnerState(
-                    train_state=train_state,
-                    env_state=env_state,
-                    last_obs=augmented_next_obs,  # Store augmented observations
-                    update_step=update_step,
-                    rng=rng
-                )
+                
+                # Update runner state
+                runner_state = (train_state, env_state, obsv, update_step, rng)
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
