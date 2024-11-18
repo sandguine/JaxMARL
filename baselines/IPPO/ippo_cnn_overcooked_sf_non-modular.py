@@ -168,6 +168,15 @@ class TrainingState(NamedTuple):
     last_obs: jnp.ndarray
     rng: Any
 
+class RunnerState(NamedTuple):
+    train_state: Any
+    feature_state: Any 
+    sf_state: Any
+    env_state: Any
+    last_obs: jnp.ndarray
+    prev_actions: jnp.ndarray
+    rng: Any
+
 def make_train_state(rng, config, env):
     """Initialize all training states"""
     rng, _rng = jax.random.split(rng)
