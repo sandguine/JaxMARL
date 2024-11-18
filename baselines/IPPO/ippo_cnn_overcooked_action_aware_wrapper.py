@@ -13,7 +13,9 @@ from flax.training.train_state import TrainState
 import distrax
 from gymnax.wrappers.purerl import LogWrapper, FlattenObservationWrapper
 import jaxmarl
+from jaxmarl.wrappers.action_aware import ActionAwareWrapper
 from jaxmarl.wrappers.baselines import LogWrapper
+from jaxmarl.environments.overcooked import Overcooked
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 import hydra
@@ -28,7 +30,6 @@ class CNN(nn.Module):
     activation: str = "tanh"
     @nn.compact
     def __call__(self, x):
-        print("CNN input shape:", x.shape)  # Debug print
         if self.activation == "relu":
             activation = nn.relu
         else:
@@ -70,6 +71,8 @@ class ActorCritic(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+        print("CNN input shape:", x.shape)  # Debug print
+
         if self.activation == "relu":
             activation = nn.relu
         else:
@@ -108,7 +111,11 @@ class Transition(NamedTuple):
 
 
 def get_rollout(params, config):
-    env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    # Create environment exactly as in make_train
+    base_env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    env = ActionAwareWrapper(base_env)
+    env = LogWrapper(env, replace_info=False)
+    
     print("Rollout observation shape:", env.observation_space().shape)  # Debug print
 
     network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
@@ -118,11 +125,14 @@ def get_rollout(params, config):
     done = False
 
     obs, state = env.reset(key_r)
-    state_seq = [state]
+    # Store original state for visualization
+    state_seq = [state.env_state]  # Access the underlying env_state
+    
     while not done:
         key, key_a0, key_a1, key_s = jax.random.split(key, 4)
 
-        obs_batch = jnp.stack([obs[a] for a in env.agents]).reshape(-1, *env.observation_space().shape)
+        # Stack observations
+        obs_batch = jnp.stack([obs[a] for a in env.agents])
         print("Observation batch shape:", obs_batch.shape)  # Debug print
 
         pi, value = network.apply(params, obs_batch)
@@ -136,8 +146,8 @@ def get_rollout(params, config):
         # STEP ENV
         obs, state, reward, done, info = env.step(key_s, state, env_act)
         done = done["__all__"]
-
-        state_seq.append(state)
+        # Store original state for visualization
+        state_seq.append(state.env_state)  # Access the underlying env_state
 
     return state_seq
 
@@ -153,8 +163,16 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
 
 
 def make_train(config):
-    env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    # Create base environment
+    base_env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    
+    # Wrap with action awareness
+    env = ActionAwareWrapper(base_env)
+    
+    # Add logging wrapper
+    env = LogWrapper(env, replace_info=False)
 
+    # Rest remains the same
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -164,6 +182,8 @@ def make_train(config):
     )
 
     env = LogWrapper(env, replace_info=False)
+
+    print("Observation space shape:", env.observation_space().shape)
 
     rew_shaping_anneal = optax.linear_schedule(
         init_value=1.,
@@ -181,10 +201,14 @@ def make_train(config):
 
     def train(rng):
 
-        # INIT NETWORK
+        # INIT NETWORK - Note we use env.observation_space().shape which now includes the action channel
         network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
         rng, _rng = jax.random.split(rng)
-        init_x = jnp.zeros((1, *env.observation_space().shape))
+        
+        # Initialize with the correct observation shape
+        obs_shape = env.observation_space().shape
+        init_x = jnp.zeros((1, *obs_shape))
+        print("Network initialization shape:", init_x.shape)
 
         network_params = network.init(_rng, init_x)
         if config["ANNEAL_LR"]:
@@ -214,14 +238,10 @@ def make_train(config):
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, update_step, rng = runner_state
 
-                # Print shapes of observations before stacking
-                print("Original observation shape:", {a: last_obs[a].shape for a in env.agents})
-
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
 
                 obs_batch = jnp.stack([last_obs[a] for a in env.agents]).reshape(-1, *env.observation_space().shape)
-                print("Stacked observation shape:", obs_batch.shape)
 
                 print("input_obs_shape", obs_batch.shape)
 
@@ -231,7 +251,6 @@ def make_train(config):
                 env_act = unbatchify(
                     action, env.agents, config["NUM_ENVS"], env.num_agents
                 )
-                print("Action shape:", {a: env_act[a].shape for a in env.agents})
 
                 env_act = {k: v.flatten() for k, v in env_act.items()}
 
