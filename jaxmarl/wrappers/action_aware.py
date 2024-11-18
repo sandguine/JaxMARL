@@ -58,10 +58,18 @@ class ActionAwareWrapper(MultiAgentEnv):
         return state
 
     def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, chex.Array], Any]:
-        """Reset environment and initialize previous actions"""
+        """Reset environment and initialize action history.
+        
+        Args:
+            key: JAX random key for environment reset
+            
+        Returns:
+            Tuple of (augmented observations, unwrapped state)
+        """
+        # Reset base environment
         obs, state = self._env.reset(key)
         
-        # Initialize previous actions as "stay"
+        # Initialize previous actions as "stay" command for all agents
         self._prev_actions = {
             agent: jnp.full((1,), Actions.stay, dtype=jnp.int32)
             for agent in self.agents
@@ -70,7 +78,7 @@ class ActionAwareWrapper(MultiAgentEnv):
         # Augment observations with previous actions
         obs = self._augment_obs(obs)
         
-        # Unwrap state if needed
+        # Ensure state is unwrapped before returning
         state = self._get_unwrapped_state(state)
         
         return obs, state
@@ -81,14 +89,23 @@ class ActionAwareWrapper(MultiAgentEnv):
         state: Any,
         actions: Dict[str, chex.Array],
     ) -> Tuple[Dict[str, chex.Array], Any, Dict[str, float], Dict[str, bool], Dict]:
-        """Step environment and update previous actions"""
-        # Unwrap state if needed
+        """Execute one environment step with action-augmented observations.
+        
+        Args:
+            key: JAX random key for environment step
+            state: Current environment state
+            actions: Dictionary mapping agent IDs to their actions
+            
+        Returns:
+            Tuple of (augmented observations, next state, rewards, dones, info)
+        """
+        # Ensure we're working with unwrapped state
         unwrapped_state = self._get_unwrapped_state(state)
         
         # Step the base environment
         obs, state, rewards, dones, info = self._env.step_env(key, unwrapped_state, actions)
         
-        # Update previous actions
+        # Store current actions for next step's observation augmentation
         self._prev_actions = actions
         
         # Augment observations with previous actions
@@ -97,10 +114,17 @@ class ActionAwareWrapper(MultiAgentEnv):
         return obs, state, rewards, dones, info
 
     def _augment_obs(self, obs: Dict[str, chex.Array]) -> Dict[str, chex.Array]:
-        """Add co-player's previous action to each agent's observation"""
+        """Add co-player's previous action as an additional channel to observations.
+        
+        Args:
+            obs: Dictionary of original observations for each agent
+            
+        Returns:
+            Dictionary of augmented observations with action channels added
+        """
         augmented_obs = {}
         for i, agent in enumerate(self.agents):
-            # Get co-player
+            # Get co-player (assume 2 agents for now)
             coplayer = self.agents[1 - i]
             
             # Get co-player's previous action and ensure it's the right shape
@@ -109,7 +133,7 @@ class ActionAwareWrapper(MultiAgentEnv):
             # Create action channel with correct shape
             # Remove extra dimensions from action and broadcast to match spatial dims
             action_channel = jnp.broadcast_to(
-                coplayer_action.reshape(-1, 1),  # Reshape to (batch_size, 1)
+                coplayer_action.reshape(-1, 1),  # Reshape to (batch_size, 1) and make action broadcastable
                 (*obs[agent].shape[:-1], 1)  # Match spatial dims with single channel
             )
             
@@ -122,10 +146,14 @@ class ActionAwareWrapper(MultiAgentEnv):
         return augmented_obs
 
     def observation_space(self) -> spaces.Box:
-        """Updated observation space to include action channel"""
+        """Define the augmented observation space.
+        
+        Returns:
+            Box space with added action channel
+        """
         base_space = self._env.observation_space()
         
-        # Handle both integer and array low/high values
+        # Handle different types of observation space bounds
         if isinstance(base_space.low, (int, float)):
             low = base_space.low
             high = base_space.high
@@ -140,7 +168,7 @@ class ActionAwareWrapper(MultiAgentEnv):
             dtype=base_space.dtype
         )
 
-    # Delegate other methods to base environment
+    # Delegate remaining environment interface to base environment
     def action_space(self, agent_id: str = "") -> spaces.Discrete:
         return self._env.action_space(agent_id)
 
@@ -148,6 +176,6 @@ class ActionAwareWrapper(MultiAgentEnv):
     def name(self) -> str:
         return f"ActionAware{self._env.name}"
 
-    # Forward any other environment properties/methods to base env
+    """Forward any other attribute requests to base environment."""
     def __getattr__(self, name):
         return getattr(self._env, name)
