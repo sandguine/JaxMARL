@@ -1,0 +1,52 @@
+"LR": 0.0005
+"NUM_ENVS": 64
+"NUM_STEPS": 256
+"TOTAL_TIMESTEPS": 5e6
+"UPDATE_EPOCHS": 4
+"NUM_MINIBATCHES": 16
+"GAMMA": 0.99
+"GAE_LAMBDA": 0.95
+"CLIP_EPS": 0.2
+"ENT_COEF": 0.01
+"VF_COEF": 0.5
+"MAX_GRAD_NORM": 0.5
+"ACTIVATION": "relu"
+"ENV_NAME": "overcooked"
+"REW_SHAPING_HORIZON": 2.5e6 # for how many timesteps add a shaping reward
+"ENV_KWARGS": 
+  "layout" : "cramped_room"
+"ANNEAL_LR": True
+"SEED": 30
+"NUM_SEEDS": 1
+"TUNE": False
+
+# WandB Configuration
+"ENTITY": "sandily"
+"PROJECT": "action-aware"
+"WANDB_MODE": "online"
+
+
+# New WandB Configuration (can be gradually migrated to)
+"WANDB":
+  "ENTITY": "sandily"
+  "PROJECT": "action-aware"
+  "WANDB_MODE": "online"
+  "GROUP": "overcooked_experiments"
+  "TAGS": ["IPPO", "CNN"]
+  "VIZ_FREQUENCY": 100  # How often to log visualizations
+  "MONITOR_METRICS":
+    - "episode_returns"
+    - "completed_dishes"
+    - "agent_collisions"
+    - "time_near_partner"
+    - "action_distribution"
+
+# Experiment Configuration
+"EXPERIMENT":
+  "USE_ACTION_AWARE": true  # Whether to use action-aware wrapper
+  "RUN_BASELINE": true  # Whether to run baseline comparison
+  "SAVE_VIDEOS": true  # Whether to save policy rollout videos
+  "COMPARISON_METRICS":
+    - "episode_returns"
+    - "completed_dishes"
+    - "collisions"
