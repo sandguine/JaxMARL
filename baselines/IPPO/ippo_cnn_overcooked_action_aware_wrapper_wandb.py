@@ -165,26 +165,27 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
 
 def make_train(config):
     """Create training function with environment setup and monitoring"""
-    # Create base environment
+    # First create base environment
     base_env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    
+    # Set NUM_ACTORS based on base environment
+    config["NUM_ACTORS"] = base_env.num_agents * config["NUM_ENVS"]
+    
+    # Calculate NUM_UPDATES from TOTAL_TIMESTEPS
+    config["NUM_UPDATES"] = int(
+        config["TOTAL_TIMESTEPS"] // (config["NUM_STEPS"] * config["NUM_ENVS"])
+    )
     
     # Add action-aware wrapper if configured
     use_action_aware = config.get("EXPERIMENT", {}).get("USE_ACTION_AWARE", False)
     if use_action_aware:
-        base_env = ActionAwareWrapper(base_env)
+        env = ActionAwareWrapper(base_env)
+    else:
+        env = base_env
     
-    # Rest remains the same
-    config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
-    config["NUM_UPDATES"] = (
-        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
-    )
-    config["MINIBATCH_SIZE"] = (
-        config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
-    )
-
     # Add logging wrapper
     env = LogWrapper(env, replace_info=False)
-
+    
     # Handle both old and new config structures
     wandb_config = {
         "project": config.get("WANDB", {}).get("PROJECT", config.get("PROJECT")),
@@ -193,15 +194,15 @@ def make_train(config):
         "group": config.get("WANDB", {}).get("GROUP", "overcooked_experiments"),
         "tags": config.get("WANDB", {}).get("TAGS", ["IPPO", "CNN"]),
     }
-
+    
     # Add WandB monitoring
     env = WandbMonitorWrapper(
         env,
-        experiment_name=f"overcooked_{config['ENV_KWARGS']['layout']}_{config.get('USE_ACTION_AWARE', False)}",
-        project=config["PROJECT"],
-        entity=config["ENTITY"],
-        tags=["IPPO", "CNN"] + (["action_aware"] if config.get("USE_ACTION_AWARE") else []),
-        group="overcooked_experiments",
+        experiment_name=f"overcooked_{config['ENV_KWARGS']['layout']}_{'aa' if use_action_aware else 'baseline'}",
+        project=wandb_config["project"],
+        entity=wandb_config["entity"],
+        tags=wandb_config["tags"] + (["action_aware"] if use_action_aware else []),
+        group=wandb_config["group"],
         config=config,
     )
 
