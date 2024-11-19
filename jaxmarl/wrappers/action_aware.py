@@ -11,7 +11,12 @@ from functools import partial
 import logging
 import os
 
+# Set up logging at the top of the file
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 class ActionAwareWrapper(MultiAgentWrapper):
     """A wrapper that enhances the environment by adding co-player's previous actions 
@@ -37,11 +42,12 @@ class ActionAwareWrapper(MultiAgentWrapper):
             
         self._base_obs_shape = self._base_obs_space.shape
         print("Base observation shape:", self._base_obs_shape)  # Debug
+        logger.debug(f"Base observation shape: {self._base_obs_shape}")
         
         # Extend observation shape to include action channel
         self.obs_shape = (
-            self._base_obs_shape[0], # Width
-            self._base_obs_shape[1], # Height
+            self._base_obs_shape[0],  # Width
+            self._base_obs_shape[1],  # Height
             self._base_obs_shape[2] + 1  # Add an additional channel for action
         )
         
@@ -166,35 +172,43 @@ class ActionAwareWrapper(MultiAgentWrapper):
             raise
 
     def observation_space(self, agent: str = "") -> spaces.Box:
-        """Define the augmented observation space.
+        """Define the augmented observation space with proper bounds.
         
+        Args:
+            agent: Optional agent identifier (unused in this implementation)
+            
         Returns:
             Box space with added action channel
         """
         try:
-            # Try getting base space without agent parameter
+            # Get base observation space
             base_space = self._env.observation_space()
-        except (TypeError, AttributeError):
-            # If that fails, try with agent parameter
-            base_space = self._env.observation_space(agent)
+            
+            # Create new Box space with extended shape
+            if hasattr(self, "obs_shape"):
+                # Handle different types of observation space bounds
+                if isinstance(base_space.low, (int, float)):
+                    low = base_space.low
+                    high = base_space.high
+                else:
+                    # Get min/max values if bounds are arrays
+                    low = base_space.low.min()
+                    high = base_space.high.max()
+                
+                # Create new space with extended shape
+                return spaces.Box(
+                    low=low,
+                    high=high,
+                    shape=self.obs_shape,
+                    dtype=base_space.dtype
+                )
+            
+            # Fallback to base space if obs_shape not defined
+            return base_space
+            
         except Exception as e:
-            logger.error(f"Failed to get observation space: {e}")
+            logger.error(f"Error getting observation space: {e}")
             raise
-
-        # Handle different types of observation space bounds
-        if isinstance(base_space.low, (int, float)):
-            low = base_space.low
-            high = base_space.high
-        else:
-            low = base_space.low.min()
-            high = base_space.high.max()
-        
-        return spaces.Box(
-            low=low,
-            high=high,
-            shape=self.obs_shape,
-            dtype=base_space.dtype
-        )
 
     # Delegate remaining environment interface to base environment
     def action_space(self, agent: str = "") -> spaces.Discrete:

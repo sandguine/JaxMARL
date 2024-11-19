@@ -8,4 +8,5 @@
 #SBATCH --qos=default
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.9
+export XLA_FLAGS="--xla_gpu_cuda_data_dir=/usr/local/cuda"
 python baselines/IPPO/ippo_cnn_overcooked_action_aware_wrapper_wandb.py

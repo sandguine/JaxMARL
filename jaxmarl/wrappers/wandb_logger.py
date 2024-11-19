@@ -14,11 +14,14 @@ from jaxmarl.wrappers.baselines import MultiAgentWrapper
 import os
 from functools import partial
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Set up logging at the top of the file
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
-class WandbMonitorWrapper(MultiAgentWrapper):
+class WandbLogger(MultiAgentWrapper):
     """Wrapper for logging Overcooked metrics to WandB.
     Handles metric collection, processing and visualization.
     """

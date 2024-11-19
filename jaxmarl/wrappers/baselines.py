@@ -7,8 +7,8 @@ import numpy as np
 from flax import struct
 from functools import partial
 import logging
-
-# from gymnax.environments import environment, spaces
+from gymnax.wrappers.purerl import LogWrapper as GymnaxLogWrapper
+from gymnax.environments import environment, spaces
 from gymnax.environments.spaces import Box as BoxGymnax, Discrete as DiscreteGymnax
 from typing import Dict, Optional, List, Tuple, Union, Any
 from jaxmarl.environments.spaces import Box, Discrete, MultiDiscrete
@@ -17,7 +17,12 @@ from jaxmarl.environments.multi_agent_env import MultiAgentEnv, State
 from safetensors.flax import save_file, load_file
 from flax.traverse_util import flatten_dict, unflatten_dict
 
+# Set up logging at the top of the file
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 def save_params(params: Dict, filename: Union[str, os.PathLike]) -> None:
     flattened_dict = flatten_dict(params, sep=',')
@@ -72,7 +77,7 @@ class LogEnvState:
     returned_episode_lengths: int
 
 
-class LogWrapper(JaxMARLWrapper):
+class BaselineWrapper(JaxMARLWrapper):
     """Log the episode returns and lengths.
     NOTE for now for envs where agents terminate at the same time.
     """
@@ -210,7 +215,7 @@ class LogWrapper(JaxMARLWrapper):
         """Render the environment."""
         return self._env.render(mode)
 
-class MPELogWrapper(LogWrapper):
+class MPELogWrapper(BaselineWrapper):
     """ Times reward signal by number of agents within the environment,
     to match the on-policy codebase. """
     
