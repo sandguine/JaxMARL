@@ -117,13 +117,9 @@ class Transition(NamedTuple):
 
 
 def get_rollout(params, config):
-    # Create environment exactly as in make_train
-    base_env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
-    env = ActionAwareWrapper(base_env)
-    env = LogWrapper(env, replace_info=False)
+    """Get rollout with consistent environment setup."""
+    env = create_env_with_wrappers(config["ENV_KWARGS"], config["SEED"])
     
-    print("Rollout observation shape:", env.observation_space().shape)  # Debug print
-
     network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
     key = jax.random.PRNGKey(0)
     key, key_r, key_a = jax.random.split(key, 3)
@@ -167,58 +163,82 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     x = x.reshape((num_actors, num_envs, -1))
     return {a: x[i] for i, a in enumerate(agent_list)}
 
-
-def make_env(env_params, seed):
-    """Create environment with proper wrapper stack"""
+def create_env_with_wrappers(env_kwargs, seed, use_wandb=False, wandb_config=None):
+    """Create environment with consistent wrapper order."""
     # Create base environment
-    base_env = Overcooked(**env_params)
+    env = Overcooked(**env_kwargs)
     
-    # Create wrapper chain
-    env = base_env
+    # Add wrappers in consistent order
+    env = LogWrapper(env, replace_info=False)  # Add logging first
+    env = ActionAwareWrapper(env)  # Then add action awareness
     
-    # Add LogWrapper first
-    env = LogWrapper(env)
-    
-    # Add ActionAwareWrapper if configured
-    if env_params.get("use_action_aware", True):
-        env = ActionAwareWrapper(env)
-        
-    # Add WandbMonitorWrapper last
-    env = WandbMonitorWrapper(
-        env,
-        experiment_name=f"overcooked_{env_params['layout']}_{'aa' if env_params.get('use_action_aware', True) else 'baseline'}",
-        project=env_params.get("project", "action-aware"),
-        entity=env_params.get("entity", "sandily"),
-    )
+    # Optionally add WandB monitoring
+    if use_wandb and wandb_config:
+        env = WandbMonitorWrapper(
+            env,
+            experiment_name=wandb_config.get("experiment_name", f"overcooked_{seed}"),
+            project=wandb_config.get("project"),
+            entity=wandb_config.get("entity"),
+            tags=wandb_config.get("tags", []),
+            group=wandb_config.get("group"),
+            config=wandb_config.get("config"),
+        )
     
     return env
+    
+def make_env(env_kwargs, seed):
+    """Create environment with proper wrapper order."""
+    return create_env_with_wrappers(env_kwargs, seed, use_wandb=True)
 
 
-def compute_gae(traj_batch, gamma, gae_lambda):
-    """Compute Generalized Advantage Estimation (GAE)"""
-    # Implement GAE computation
-    advantages = []
-    returns = []
-    gae = 0.0
+def compute_gae(traj_batch, last_val, config):
+    """Compute Generalized Advantage Estimation (GAE).
     
-    for t in reversed(range(len(traj_batch.reward))):
-        if t == len(traj_batch.reward) - 1:
-            next_value = 0.0
-        else:
-            next_value = traj_batch.value[t + 1]
-            
-        delta = (
-            traj_batch.reward[t] 
-            + gamma * next_value * (1 - traj_batch.done[t]) 
-            - traj_batch.value[t]
-        )
-        
-        gae = delta + gamma * gae_lambda * (1 - traj_batch.done[t]) * gae
-        
-        advantages.insert(0, gae)
-        returns.insert(0, gae + traj_batch.value[t])
+    Args:
+        traj_batch: Trajectory batch containing rewards, values, and dones
+        last_val: The value estimate for the last state
+        config: Config dict containing GAMMA and GAE_LAMBDA parameters
     
-    return jnp.array(advantages), jnp.array(returns)
+    Returns:
+        tuple: (advantages, returns) as JAX arrays
+    """
+    # Get values from config
+    gamma = config["GAMMA"]
+    gae_lambda = config["GAE_LAMBDA"]
+    
+    # Ensure proper shapes for vectorized operations
+    rewards = jnp.array(traj_batch.reward)  # Shape (T, B)
+    values = jnp.array(traj_batch.value)    # Shape (T, B)
+    dones = jnp.array(traj_batch.done)      # Shape (T, B)
+    
+    # Append last_val to values for computing deltas
+    values_next = jnp.concatenate([values[1:], last_val[None, :]], axis=0)  # Shape (T, B)
+    
+    # Compute TD-error
+    deltas = rewards + gamma * values_next * (1 - dones) - values
+    
+    def _get_advantages(carry, transition):
+        """Compute advantages for a single timestep."""
+        gae = carry
+        delta, done = transition
+        
+        # Update GAE
+        gae = delta + gamma * gae_lambda * (1 - done) * gae
+        
+        return gae, gae
+
+    # Compute advantages using scan (more efficient than Python loop)
+    _, advantages = jax.lax.scan(
+        _get_advantages,
+        jnp.zeros_like(last_val),  # Initial GAE
+        (deltas, dones),
+        reverse=True,
+    )
+    
+    # Compute returns from advantages
+    returns = advantages + values
+    
+    return advantages, returns
 
 
 def check_convergence(returns_history, 
@@ -263,21 +283,26 @@ def make_train(config):
         # Split RNG for different uses
         key, key_env, key_net = jax.random.split(rng, 3)
         
-        # Create environment with wrapper stack
-        env = make_env(config["ENV_KWARGS"], config["SEED"])
-        env = WandbMonitorWrapper(
-            env,
-            experiment_name=f"overcooked_{config['ENV_KWARGS']['layout']}_{'aa' if config['EXPERIMENT'].get('USE_ACTION_AWARE', False) else 'baseline'}",
-            project=config.get("WANDB", {}).get("PROJECT", config.get("PROJECT")),
-            entity=config.get("WANDB", {}).get("ENTITY", config.get("ENTITY")),
-            tags=config.get("WANDB", {}).get("TAGS", ["IPPO", "CNN"]) + (["action_aware"] if config['EXPERIMENT'].get('USE_ACTION_AWARE', False) else []),
-            group=config.get("WANDB", {}).get("GROUP", "overcooked_experiments"),
-            config=config,
+        # Create environment with consistent wrapper stack
+        wandb_config = {
+            "experiment_name": f"overcooked_{config['ENV_KWARGS']['layout']}_{'aa' if config['EXPERIMENT'].get('USE_ACTION_AWARE', False) else 'baseline'}",
+            "project": config.get("WANDB", {}).get("PROJECT", config.get("PROJECT")),
+            "entity": config.get("WANDB", {}).get("ENTITY", config.get("ENTITY")),
+            "tags": config.get("WANDB", {}).get("TAGS", ["IPPO", "CNN"]) + (["action_aware"] if config['EXPERIMENT'].get('USE_ACTION_AWARE', False) else []),
+            "group": config.get("WANDB", {}).get("GROUP", "overcooked_experiments"),
+            "config": config,
+        }
+        
+        env = create_env_with_wrappers(
+            config["ENV_KWARGS"], 
+            config["SEED"],
+            use_wandb=True,
+            wandb_config=wandb_config
         )
-
+        
         # Update NUM_ACTORS based on environment
         config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
-
+        
         # Initialize network and optimizer
         network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
         
@@ -317,6 +342,7 @@ def make_train(config):
             train_state,
             env_state,
             obs,
+            jnp.zeros(config["NUM_ENVS"]),  # Initial done flags
             key,
         )
 
@@ -330,39 +356,43 @@ def make_train(config):
             train_state, env_state, obs, key = runner_state
             
             # Collect trajectories
-            def _env_step(carry, unused):
-                train_state, env_state, obs, key = carry
+            def _env_step(runner_state, unused):
+                # Unpack runner state
+                key, train_state, last_obs, last_done, env_state = runner_state
+
+                # Split key for various random operations
                 key, key_step = jax.random.split(key)
-                
-                # Stack observations for all agents
-                obs_batch = jnp.stack([obs[a] for a in env.agents])
-                
-                # Get actions from policy
+
+                # Get action from policy
+                obs_batch = batchify(last_obs, env.agents, config["NUM_ENVS"])
                 pi, value = network.apply(train_state.params, obs_batch)
                 action = pi.sample(seed=key_step)
                 log_prob = pi.log_prob(action)
                 
                 # Convert actions to environment format
-                env_actions = unbatchify(action, env.agents, 1, env.num_agents)
+                env_actions = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
                 env_actions = {k: v.squeeze() for k, v in env_actions.items()}
                 
                 # Step environment
-                next_obs, next_env_state, reward, done, info = env.step(
-                    key_step, env_state, env_actions
-                )
-                
+                env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
+                obs, env_state, reward, done, info = env.step(key_step, env_state, env_act)
+
+                # Process rewards to ensure proper shape
+                reward_array = batchify(reward, env.agents, config["NUM_ENVS"])
+
                 transition = Transition(
-                    done=done,
+                    done=done["__all__"],
                     action=action,
                     value=value,
-                    reward=reward,
+                    reward=reward_array,  # Use processed reward array
                     log_prob=log_prob,
                     obs=obs_batch,
                     info=info,
                 )
-                
-                carry = (train_state, next_env_state, next_obs, key)
-                return carry, transition
+
+                # Update runner state
+                runner_state = (key, train_state, obs, done["__all__"], env_state)
+                return runner_state, transition
             
             # Collect trajectories for NUM_STEPS
             runner_state, traj_batch = jax.lax.scan(
@@ -447,7 +477,7 @@ def make_train(config):
             )
             
             train_state = update_state[0]
-            runner_state = (train_state, env_state, obs, key)
+            runner_state = (train_state, env_state, obs, done, key)  # Include done flags
             
             # Track episode returns
             episode_return = metrics.get("episode_return", 0.0)

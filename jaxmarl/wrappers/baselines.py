@@ -6,6 +6,7 @@ import chex
 import numpy as np
 from flax import struct
 from functools import partial
+import logging
 
 # from gymnax.environments import environment, spaces
 from gymnax.environments.spaces import Box as BoxGymnax, Discrete as DiscreteGymnax
@@ -15,6 +16,8 @@ from jaxmarl.environments.multi_agent_env import MultiAgentEnv, State
 
 from safetensors.flax import save_file, load_file
 from flax.traverse_util import flatten_dict, unflatten_dict
+
+logger = logging.getLogger(__name__)
 
 def save_params(params: Dict, filename: Union[str, os.PathLike]) -> None:
     flattened_dict = flatten_dict(params, sep=',')
@@ -44,6 +47,9 @@ class JaxMARLWrapper(MultiAgentWrapper):
 
     def __init__(self, env: MultiAgentEnv):
         self._env = env
+        self.debug = os.environ.get('JAXMARL_DEBUG', '0') == '1'
+        if self.debug:
+            logger.setLevel(logging.DEBUG)
 
     def __getattr__(self, name: str):
         return getattr(self._env, name)
@@ -52,8 +58,9 @@ class JaxMARLWrapper(MultiAgentWrapper):
     #     x = jnp.stack([x[a] for a in self._env.agents])
     #     return x.reshape((self._env.num_agents, -1))
 
-    def _batchify_floats(self, x: dict):
-        return jnp.stack([x[a] for a in self._env.agents])
+    def _batchify_floats(self, x: dict) -> jnp.ndarray:
+        """Convert dict of floats to proper array."""
+        return jnp.array([x[a] for a in self._env.agents])
 
 
 @struct.dataclass
@@ -73,7 +80,10 @@ class LogWrapper(JaxMARLWrapper):
     def __init__(self, env: MultiAgentEnv, replace_info: bool = False):
         super().__init__(env)
         self.replace_info = replace_info
-        self.num_agents = len(env.agents)
+        self._num_agents = len(env.agents)
+        self.debug = os.environ.get('JAXMARL_DEBUG', '0') == '1'
+        if self.debug:
+            logger.setLevel(logging.DEBUG)
 
     def _get_episode_returns(self, state, reward):
         """Default implementation if environment doesn't provide one"""
@@ -81,7 +91,7 @@ class LogWrapper(JaxMARLWrapper):
             return self._env._get_episode_returns(state, reward)
         except AttributeError:
             # If environment doesn't track returns, just return zeros
-            return jnp.zeros(self.num_agents)
+            return jnp.zeros(self._num_agents)
 
     def _get_episode_lengths(self, state):
         """Default implementation if environment doesn't provide one"""
@@ -89,7 +99,7 @@ class LogWrapper(JaxMARLWrapper):
             return self._env._get_episode_lengths(state)
         except AttributeError:
             # If environment doesn't track lengths, just return zeros
-            return jnp.zeros(self.num_agents)
+            return jnp.zeros(self._num_agents)
 
     def _convert_to_log_state(self, state, reward):
         # If state is already LogEnvState, return as is
@@ -101,8 +111,8 @@ class LogWrapper(JaxMARLWrapper):
             env_state=state,
             episode_returns=self._get_episode_returns(state, reward),
             episode_lengths=self._get_episode_lengths(state),
-            returned_episode_returns=jnp.zeros(self.num_agents),
-            returned_episode_lengths=jnp.zeros(self.num_agents)
+            returned_episode_returns=jnp.zeros(self._num_agents),
+            returned_episode_lengths=jnp.zeros(self._num_agents)
         )
 
     @partial(jax.jit, static_argnums=(0,))
@@ -111,10 +121,10 @@ class LogWrapper(JaxMARLWrapper):
         obs, state = self._env.reset(key)
         log_state = LogEnvState(
             env_state=state,
-            episode_returns=jnp.zeros((self.num_agents,)),
-            episode_lengths=jnp.zeros((self.num_agents,)),
-            returned_episode_returns=jnp.zeros((self.num_agents,)),
-            returned_episode_lengths=jnp.zeros((self.num_agents,)),
+            episode_returns=jnp.zeros((self._num_agents,)),
+            episode_lengths=jnp.zeros((self._num_agents,)),
+            returned_episode_returns=jnp.zeros((self._num_agents,)),
+            returned_episode_lengths=jnp.zeros((self._num_agents,)),
         )
         return obs, log_state
 
@@ -129,7 +139,11 @@ class LogWrapper(JaxMARLWrapper):
             key, state.env_state, actions
         )
         ep_done = done["__all__"]
-        new_episode_return = state.episode_returns + self._batchify_floats(reward)
+        
+        # Ensure reward is properly formatted
+        reward_array = self._batchify_floats(reward)
+        
+        new_episode_return = state.episode_returns + reward_array
         new_episode_length = state.episode_lengths + 1
         
         log_state = LogEnvState(
@@ -146,9 +160,9 @@ class LogWrapper(JaxMARLWrapper):
             info = {}
         info["returned_episode_returns"] = log_state.returned_episode_returns
         info["returned_episode_lengths"] = log_state.returned_episode_lengths
-        info["returned_episode"] = jnp.full((self.num_agents,), ep_done)
+        info["returned_episode"] = jnp.full((self._num_agents,), ep_done)
         
-        return next_obs, log_state, reward, done, info
+        return next_obs, log_state, reward_array, done, info
 
     @property
     def action_space(self) -> Union[Discrete, Box]:
@@ -163,20 +177,30 @@ class LogWrapper(JaxMARLWrapper):
     @property
     def num_agents(self) -> int:
         """Get the number of agents in the environment."""
-        return len(self._env.agents)
+        return self._num_agents
 
     @property
     def agents(self) -> List[str]:
         """Get the list of agent identifiers."""
         return self._env.agents
 
-    def observation_space(self, agent: str) -> Union[Discrete, Box]:
+    def observation_space(self, agent: str = "") -> Union[Discrete, Box]:
         """Get the observation space for a specific agent."""
-        return self._env.observation_space(agent)
+        try:
+            # Try with agent parameter first
+            return self._env.observation_space(agent)
+        except (TypeError, AttributeError):
+            # Fall back to no parameter if that fails
+            return self._env.observation_space()
 
-    def action_space(self, agent: str) -> Union[Discrete, Box]:
+    def action_space(self, agent: str = "") -> Union[Discrete, Box]:
         """Get the action space for a specific agent."""
-        return self._env.action_space(agent)
+        try:
+            # Try with agent parameter first
+            return self._env.action_space(agent)
+        except (TypeError, AttributeError):
+            # Fall back to no parameter if that fails
+            return self._env.action_space()
 
     def state_space(self) -> Union[Discrete, Box]:
         """Get the state space of the environment."""
@@ -235,6 +259,9 @@ class SMAXLogWrapper(JaxMARLWrapper):
     def __init__(self, env: MultiAgentEnv, replace_info: bool = False):
         super().__init__(env)
         self.replace_info = replace_info
+        self.debug = os.environ.get('JAXMARL_DEBUG', '0') == '1'
+        if self.debug:
+            logger.setLevel(logging.DEBUG)
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, State]:

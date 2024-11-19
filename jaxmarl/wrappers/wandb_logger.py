@@ -11,6 +11,8 @@ from jaxmarl.environments import MultiAgentEnv
 import datetime
 import numpy as np
 from jaxmarl.wrappers.baselines import MultiAgentWrapper
+import os
+from functools import partial
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -83,6 +85,10 @@ class WandbMonitorWrapper(MultiAgentWrapper):
         
         # Set up custom WandB charts
         self._setup_wandb_charts()
+
+        # Add logging level based on debug flag
+        if self.debug:
+            logger.setLevel(logging.DEBUG)
 
     def _setup_wandb_charts(self):
         """Configure custom WandB charts and panels with comprehensive monitoring"""
@@ -293,11 +299,12 @@ class WandbMonitorWrapper(MultiAgentWrapper):
         
         return obs, state
 
-    def step_env(
-        self, 
-        key: chex.PRNGKey, 
-        state: Any, 
-        actions: Dict[str, chex.Array]
+    @partial(jax.jit, static_argnums=(0,))
+    def step(
+        self,
+        key: chex.PRNGKey,
+        state: Any,
+        actions: Dict[str, chex.Array],
     ) -> Tuple[Dict[str, chex.Array], Any, Dict[str, float], Dict[str, bool], Dict]:
         """Execute environment step with comprehensive metric tracking and error handling.
         

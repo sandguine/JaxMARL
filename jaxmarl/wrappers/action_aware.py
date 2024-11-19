@@ -7,6 +7,11 @@ from jaxmarl.environments import MultiAgentEnv
 from jaxmarl.environments import spaces
 from jaxmarl.environments.overcooked.overcooked import Actions
 from jaxmarl.wrappers.baselines import MultiAgentWrapper
+from functools import partial
+import logging
+import os
+
+logger = logging.getLogger(__name__)
 
 class ActionAwareWrapper(MultiAgentWrapper):
     """A wrapper that enhances the environment by adding co-player's previous actions 
@@ -20,12 +25,16 @@ class ActionAwareWrapper(MultiAgentWrapper):
     def __init__(self, env):
         super().__init__(env)
         self._env = env
-        # Store list of agents
-        self.agents = env.agents
+        self._num_agents = len(env.agents)
         
         # Get base observation shape and space
-        self._base_obs_space = env.observation_space()
-        # Store shape of base observation space
+        try:
+            # Try getting observation space without agent parameter first
+            self._base_obs_space = env.observation_space()
+        except (TypeError, AttributeError):
+            # If that fails, try with the first agent
+            self._base_obs_space = env.observation_space(env.agents[0])
+            
         self._base_obs_shape = self._base_obs_space.shape
         print("Base observation shape:", self._base_obs_shape)  # Debug
         
@@ -35,10 +44,13 @@ class ActionAwareWrapper(MultiAgentWrapper):
             self._base_obs_shape[1], # Height
             self._base_obs_shape[2] + 1  # Add an additional channel for action
         )
-        print("Wrapped observation shape:", self.obs_shape)  # Debug
         
         # Initialize storage for previous actions (will be set in reset)
         self._prev_actions = None
+        
+        self.debug = os.environ.get('JAXMARL_DEBUG', '0') == '1'
+        if self.debug:
+            logger.setLevel(logging.DEBUG)
 
     def _get_unwrapped_state(self, state):
         """Recursively unwrap state object until we get to the base state.
@@ -82,7 +94,8 @@ class ActionAwareWrapper(MultiAgentWrapper):
         
         return obs, state
 
-    def step_env(
+    @partial(jax.jit, static_argnums=(0,))
+    def step(
         self,
         key: chex.PRNGKey,
         state: Any,
@@ -101,9 +114,9 @@ class ActionAwareWrapper(MultiAgentWrapper):
         # Ensure we're working with unwrapped state
         unwrapped_state = self._get_unwrapped_state(state)
         
-        # Step the base environment
-        obs, state, rewards, dones, info = self._env.step_env(key, unwrapped_state, actions)
-        
+        # Step the base environment and store results in obs, state, rewards, dones, info
+        obs, state, rewards, dones, info = self._env.step(key, unwrapped_state, actions)
+
         # Store current actions for next step's observation augmentation
         self._prev_actions = actions
         
@@ -121,37 +134,53 @@ class ActionAwareWrapper(MultiAgentWrapper):
         Returns:
             Dictionary of augmented observations with action channels added
         """
-        augmented_obs = {}
-        for i, agent in enumerate(self.agents):
-            # Get co-player (assume 2 agents for now)
-            coplayer = self.agents[1 - i]
-            
-            # Get co-player's previous action and ensure it's the right shape
-            coplayer_action = self._prev_actions[coplayer]
-            
-            # Create action channel with correct shape
-            # Remove extra dimensions from action and broadcast to match spatial dims
-            action_channel = jnp.broadcast_to(
-                coplayer_action.reshape(-1, 1),  # Reshape to (batch_size, 1) and make action broadcastable
-                (*obs[agent].shape[:-1], 1)  # Match spatial dims with single channel
-            )
-            
-            # Concatenate base observation with action channel
-            augmented_obs[agent] = jnp.concatenate(
-                [obs[agent], action_channel],
-                axis=-1
-            )
-            
-        return augmented_obs
+        try:
+            augmented_obs = {}
+            for i, agent in enumerate(self.agents):
+                if len(self.agents) < 2:
+                    logger.warning("Less than 2 agents found, using default action")
+                    coplayer_action = jnp.array([Actions.stay])
+                else:
+                    coplayer = self.agents[1 - i]
+                    coplayer_action = self._prev_actions[coplayer]
+                
+                # Get co-player's previous action and ensure it's the right shape
+                coplayer_action = self._prev_actions[coplayer]
+                
+                # Create action channel with correct shape
+                # Remove extra dimensions from action and broadcast to match spatial dims
+                action_channel = jnp.broadcast_to(
+                    coplayer_action.reshape(-1, 1),  # Reshape to (batch_size, 1) and make action broadcastable
+                    (*obs[agent].shape[:-1], 1)  # Match spatial dims with single channel
+                )
+                
+                # Concatenate base observation with action channel
+                augmented_obs[agent] = jnp.concatenate(
+                    [obs[agent], action_channel],
+                    axis=-1
+                )
+                
+            return augmented_obs
+        except Exception as e:
+            logger.error(f"Error in observation augmentation: {e}")
+            raise
 
-    def observation_space(self) -> spaces.Box:
+    def observation_space(self, agent: str = "") -> spaces.Box:
         """Define the augmented observation space.
         
         Returns:
             Box space with added action channel
         """
-        base_space = self._env.observation_space()
-        
+        try:
+            # Try getting base space without agent parameter
+            base_space = self._env.observation_space()
+        except (TypeError, AttributeError):
+            # If that fails, try with agent parameter
+            base_space = self._env.observation_space(agent)
+        except Exception as e:
+            logger.error(f"Failed to get observation space: {e}")
+            raise
+
         # Handle different types of observation space bounds
         if isinstance(base_space.low, (int, float)):
             low = base_space.low
@@ -168,8 +197,12 @@ class ActionAwareWrapper(MultiAgentWrapper):
         )
 
     # Delegate remaining environment interface to base environment
-    def action_space(self, agent_id: str = "") -> spaces.Discrete:
-        return self._env.action_space(agent_id)
+    def action_space(self, agent: str = "") -> spaces.Discrete:
+        """Get the action space."""
+        try:
+            return self._env.action_space()
+        except (TypeError, AttributeError):
+            return self._env.action_space(agent)
 
     @property
     def name(self) -> str:
