@@ -1,5 +1,6 @@
 # File: jaxmarl/wrappers/wandb_logger.py
 
+import logging
 from typing import Dict, Tuple, Any
 import jax
 import jax.numpy as jnp
@@ -7,6 +8,10 @@ import wandb
 import chex
 from flax import struct
 from jaxmarl.environments import MultiAgentEnv
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class WandbMonitorWrapper(MultiAgentEnv):
     """Wrapper for logging Overcooked metrics to WandB.
@@ -22,10 +27,12 @@ class WandbMonitorWrapper(MultiAgentEnv):
         tags: list = None,
         group: str = None,
         config: dict = None,
+        debug: bool = False,
     ):
         super().__init__(num_agents=env.num_agents)
         self._env = env
         self.agents = env.agents
+        self.debug = debug
 
         # Add action names for better visualization
         self.action_names = {
@@ -143,17 +150,19 @@ class WandbMonitorWrapper(MultiAgentEnv):
         })
     
     def _get_unwrapped_state(self, state):
-        """Helper to unwrap state if needed.
+        """Helper to unwrap state if needed."""
+        original_type = type(state).__name__
+        current_state = state
+        unwrap_chain = [original_type]
         
-        Args:
-            state: The state object which may be wrapped
+        while hasattr(current_state, 'env_state'):
+            current_state = current_state.env_state
+            unwrap_chain.append(type(current_state).__name__)
         
-        Returns:
-            The unwrapped state object
-        """
-        while hasattr(state, 'env_state'):
-            state = state.env_state
-        return state
+        if len(unwrap_chain) > 1:
+            print(f"State unwrapping chain: {' -> '.join(unwrap_chain)}")
+        
+        return current_state
 
     def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, chex.Array], Any]:
         """Reset environment and metrics"""
@@ -175,24 +184,12 @@ class WandbMonitorWrapper(MultiAgentEnv):
         
         return obs, state
 
-    def step_env(
-        self,
-        key: chex.PRNGKey,
-        state: Any,
-        actions: Dict[str, chex.Array],
-    ) -> Tuple[Dict[str, chex.Array], Any, Dict[str, float], Dict[str, bool], Dict]:
-        """Step environment and log metrics"""
-        # Get unwrapped state for the base environment
+    def step_env(self, key, state, actions):
+        # Get unwrapped state and step environment
         unwrapped_state = self._get_unwrapped_state(state)
-        
-        # Step the base environment
         obs, next_state, rewards, dones, info = self._env.step_env(key, unwrapped_state, actions)
         
-        # Rewrap the state if original was wrapped
-        if hasattr(state, 'env_state'):
-            next_state = state.replace(env_state=next_state)
-        
-        # Update step count and basic metrics
+        # Update basic metrics
         self._step_count += 1
         for agent in self.agents:
             self._episode_rewards[agent] += rewards[agent]
@@ -201,37 +198,33 @@ class WandbMonitorWrapper(MultiAgentEnv):
         # Track action statistics
         for agent, action in actions.items():
             self._action_counts = self._action_counts.at[int(action)].add(1)
-            
-        # Calculate movement ratio
-        movement_actions = sum(1 for a in actions.values() if a < 4)  # up, down, left, right
+        
+        # Calculate movement ratio (up, down, left, right)
+        movement_actions = sum(1 for a in actions.values() if a < 4)
         self._movement_ratio = movement_actions / len(actions)
         
-        # Calculate interaction ratio
-        interact_actions = sum(1 for a in actions.values() if a == 5)  # interact action
+        # Calculate interaction ratio (interact action)
+        interact_actions = sum(1 for a in actions.values() if a == 5)
         self._interaction_ratio = interact_actions / len(actions)
         
+        # Track agent positions and interactions
         try:
-            # Get unwrapped next state for collision detection
             unwrapped_next_state = self._get_unwrapped_state(next_state)
-            
-            # Check for collisions
             if hasattr(unwrapped_next_state, 'agent_pos'):
                 agent_positions = unwrapped_next_state.agent_pos
+                # Check for collisions (exact same position)
                 collision = jnp.all(agent_positions[0] == agent_positions[1])
                 self._episode_collisions += collision
                 
-                # Check proximity (Manhattan distance)
+                # Check proximity (adjacent squares)
                 distance = jnp.sum(jnp.abs(agent_positions[0] - agent_positions[1]))
-                self._proximity_count += (distance <= 1)  # Count when agents are adjacent
-                
+                self._proximity_count += (distance <= 1)
         except AttributeError:
-            # Handle cases where state doesn't have expected attributes
-            pass
-            
+            if self.debug:
+                logger.debug("Could not access agent positions")
+        
         # Process rewards and track task completion
         shaped_rewards = info.get("shaped_reward", {})
-        
-        # Track specific reward components
         if shaped_rewards:
             self._onion_rewards += shaped_rewards.get("onion_rewards", 0)
             self._plate_rewards += shaped_rewards.get("plate_rewards", 0)
@@ -239,16 +232,16 @@ class WandbMonitorWrapper(MultiAgentEnv):
                 self._episode_dishes += 1
                 self._total_dishes += 1
         
-        # Track best performance
+        # Update best performance metrics
         episode_return = sum(self._episode_rewards.values())
         self._best_return = max(self._best_return, episode_return)
         self._best_dishes = max(self._best_dishes, self._total_dishes)
         
-        # Log metrics
+        # Log episode metrics if done
         if dones["__all__"]:
             self._log_episode_metrics()
         
-        # Log step-wise metrics
+        # Log step metrics
         metrics = {
             "step/mean_reward": jnp.mean(jnp.array(list(rewards.values()))),
             "step/movement_ratio": self._movement_ratio,
@@ -257,7 +250,6 @@ class WandbMonitorWrapper(MultiAgentEnv):
             "step": self._step_count,
         }
         
-        # Add shaped rewards to metrics if available
         if shaped_rewards:
             metrics.update({
                 f"step/shaped_rewards/{k}": v 
@@ -267,6 +259,40 @@ class WandbMonitorWrapper(MultiAgentEnv):
         wandb.log(metrics)
         
         return obs, next_state, rewards, dones, info
+
+    def _update_metrics(self, actions, rewards, next_state, info):
+        """Update metrics with error checking."""
+        try:
+            # Update step count and basic metrics
+            self._step_count += 1
+            for agent in self.agents:
+                self._episode_rewards[agent] += rewards[agent]
+                self._episode_lengths[agent] += 1
+            
+            # Track action statistics
+            for agent, action in actions.items():
+                try:
+                    self._action_counts = self._action_counts.at[int(action)].add(1)
+                except Exception as e:
+                    logger.error(f"Error updating action counts for agent {agent}: {e}")
+            
+            # Calculate ratios
+            try:
+                movement_actions = sum(1 for a in actions.values() if a < 4)
+                self._movement_ratio = movement_actions / len(actions)
+                interact_actions = sum(1 for a in actions.values() if a == 5)
+                self._interaction_ratio = interact_actions / len(actions)
+            except Exception as e:
+                logger.error(f"Error calculating action ratios: {e}")
+            
+            # Update other metrics
+            if self.debug:
+                logger.debug(f"Current episode rewards: {self._episode_rewards}")
+                logger.debug(f"Current action counts: {self._action_counts}")
+                
+        except Exception as e:
+            logger.error(f"Error in _update_metrics: {e}")
+            raise
 
     def _update_tables(self, step: int, metrics: dict):
         """Update the custom tables with new data"""
@@ -349,8 +375,13 @@ class WandbMonitorWrapper(MultiAgentEnv):
         wandb.log(metrics)
 
     def close(self):
-        """Finish WandB run"""
-        wandb.finish()
+        """Cleanup with error handling."""
+        try:
+            if self.debug:
+                logger.info("Closing WandbMonitorWrapper")
+            wandb.finish()
+        except Exception as e:
+            logger.error(f"Error closing wandb: {e}")
 
     # Forward other methods to wrapped env
     def observation_space(self):
@@ -370,6 +401,11 @@ class WandbMonitorWrapper(MultiAgentEnv):
             value: New value for the metric
         """
         try:
-            wandb.log({metric_name: float(value)})
+            float_value = float(value)
+            wandb.log({metric_name: float_value})
+            if self.debug:
+                logger.debug(f"Updated metric {metric_name}: {float_value}")
+        except ValueError as e:
+            logger.error(f"Error converting metric value to float: {e}")
         except Exception as e:
-            print(f"Warning: Failed to log metric {metric_name}: {e}")
+            logger.error(f"Error logging metric {metric_name}: {e}")
