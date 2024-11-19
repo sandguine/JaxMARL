@@ -86,7 +86,7 @@ class WandbMonitorWrapper(MultiAgentEnv):
         # Core metrics with appropriate summary statistics
         wandb.define_metric("episode/returns", summary="mean")
         wandb.define_metric("episode/lengths", summary="mean")
-        wandb.define_metric("episode/completed_dishes", summary="sum")
+        wandb.define_metric("episode/completed_dishes", summary="max")
         wandb.define_metric("episode/agent_collisions", summary="mean")
         wandb.define_metric("episode/total_dishes", summary="max")
         
@@ -119,7 +119,7 @@ class WandbMonitorWrapper(MultiAgentEnv):
             
             # Action distribution
             "charts/action_dist": wandb.Table(
-                columns=["Action Type", "Count", "Percentage of Total"],
+                columns=["Action Type", "Count", "Percentage"],
                 data=[]
             ),
             
@@ -130,22 +130,20 @@ class WandbMonitorWrapper(MultiAgentEnv):
             )
         })
         
-        # Set up custom plots with better titles and labels
+        # Set up custom plots
         wandb.log({
             "charts/action_histogram": wandb.plot.histogram(
                 wandb.Table(columns=["Action Type"]),
                 "Action Type",
-                title="Distribution of Agent Actions",
-                x_label="Action Type",
-                y_label="Count"
+                title="Distribution of Agent Actions"
             ),
             
             "charts/training_progress": wandb.plot.line_series(
-                xs=[0],  # Steps
-                ys=[[0], [0]],  # Initial values
-                keys=["returns", "dishes"],
-                title="Training Progress",
-                xname="steps"
+                xs=[0],
+                ys=[[0], [0]],
+                keys=["Episode Returns", "Completed Dishes"],
+                title="Training Progress Over Time",
+                xname="Training Steps"
             )
         })
     
@@ -184,44 +182,39 @@ class WandbMonitorWrapper(MultiAgentEnv):
         
         return obs, state
 
-    def step_env(self, key, state, actions):
-        # Get unwrapped state and step environment
+    def step_env(
+        self,
+        key: chex.PRNGKey,
+        state: Any,
+        actions: Dict[str, chex.Array],
+    ) -> Tuple[Dict[str, chex.Array], Any, Dict[str, float], Dict[str, bool], Dict]:
+        """Step environment and log metrics"""
+        # Get unwrapped state for the base environment
         unwrapped_state = self._get_unwrapped_state(state)
+        
+        # Step the base environment
         obs, next_state, rewards, dones, info = self._env.step_env(key, unwrapped_state, actions)
         
-        # Update basic metrics
+        # Update step count and basic metrics
         self._step_count += 1
         for agent in self.agents:
             self._episode_rewards[agent] += rewards[agent]
             self._episode_lengths[agent] += 1
         
-        # Track action statistics
-        for agent, action in actions.items():
-            self._action_counts = self._action_counts.at[int(action)].add(1)
+        # Convert actions to array for vectorized operations
+        action_array = jnp.array([actions[agent] for agent in self.agents])
         
-        # Calculate movement ratio (up, down, left, right)
-        movement_actions = sum(1 for a in actions.values() if a < 4)
-        self._movement_ratio = movement_actions / len(actions)
+        # Track action statistics using JAX operations
+        for idx in range(len(action_array)):
+            self._action_counts = self._action_counts.at[action_array[idx]].add(1)
+            
+        # Calculate movement ratio (actions 0-3 are movement)
+        movement_mask = jnp.where(action_array < 4, 1, 0)
+        self._movement_ratio = jnp.sum(movement_mask) / len(action_array)
         
-        # Calculate interaction ratio (interact action)
-        interact_actions = sum(1 for a in actions.values() if a == 5)
-        self._interaction_ratio = interact_actions / len(actions)
-        
-        # Track agent positions and interactions
-        try:
-            unwrapped_next_state = self._get_unwrapped_state(next_state)
-            if hasattr(unwrapped_next_state, 'agent_pos'):
-                agent_positions = unwrapped_next_state.agent_pos
-                # Check for collisions (exact same position)
-                collision = jnp.all(agent_positions[0] == agent_positions[1])
-                self._episode_collisions += collision
-                
-                # Check proximity (adjacent squares)
-                distance = jnp.sum(jnp.abs(agent_positions[0] - agent_positions[1]))
-                self._proximity_count += (distance <= 1)
-        except AttributeError:
-            if self.debug:
-                logger.debug("Could not access agent positions")
+        # Calculate interaction ratio (action 5 is interact)
+        interact_mask = jnp.where(action_array == 5, 1, 0)
+        self._interaction_ratio = jnp.sum(interact_mask) / len(action_array)
         
         # Process rewards and track task completion
         shaped_rewards = info.get("shaped_reward", {})
@@ -232,12 +225,12 @@ class WandbMonitorWrapper(MultiAgentEnv):
                 self._episode_dishes += 1
                 self._total_dishes += 1
         
-        # Update best performance metrics
-        episode_return = sum(self._episode_rewards.values())
-        self._best_return = max(self._best_return, episode_return)
-        self._best_dishes = max(self._best_dishes, self._total_dishes)
+        # Track best performance
+        episode_return = jnp.sum(jnp.array(list(self._episode_rewards.values())))
+        self._best_return = jnp.maximum(self._best_return, episode_return)
+        self._best_dishes = jnp.maximum(self._best_dishes, self._total_dishes)
         
-        # Log episode metrics if done
+        # Log metrics
         if dones["__all__"]:
             self._log_episode_metrics()
         
@@ -278,9 +271,9 @@ class WandbMonitorWrapper(MultiAgentEnv):
             
             # Calculate ratios
             try:
-                movement_actions = sum(1 for a in actions.values() if a < 4)
+                movement_actions = jnp.sum(jnp.where(jnp.array(list(actions.values())) < 4, 1, 0))
                 self._movement_ratio = movement_actions / len(actions)
-                interact_actions = sum(1 for a in actions.values() if a == 5)
+                interact_actions = jnp.sum(jnp.where(jnp.array(list(actions.values())) == 5, 1, 0))
                 self._interaction_ratio = interact_actions / len(actions)
             except Exception as e:
                 logger.error(f"Error calculating action ratios: {e}")
