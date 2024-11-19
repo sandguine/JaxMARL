@@ -10,12 +10,13 @@ from flax import struct
 from jaxmarl.environments import MultiAgentEnv
 import datetime
 import numpy as np
+from jaxmarl.wrappers.baselines import MultiAgentWrapper
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class WandbMonitorWrapper(MultiAgentEnv):
+class WandbMonitorWrapper(MultiAgentWrapper):
     """Wrapper for logging Overcooked metrics to WandB.
     Handles metric collection, processing and visualization.
     """
@@ -31,7 +32,7 @@ class WandbMonitorWrapper(MultiAgentEnv):
         config: dict = None,
         debug: bool = False,
     ):
-        super().__init__(num_agents=env.num_agents)
+        super().__init__(env)
         self._env = env
         self.agents = env.agents
         self.debug = debug
@@ -90,7 +91,7 @@ class WandbMonitorWrapper(MultiAgentEnv):
             metrics_config = {
                 "episode/returns": "mean",
                 "episode/lengths": "mean",
-                "episode/completed_dishes": "sum",
+                "episode/completed_dishes": "max",
                 "episode/agent_collisions": "mean",
                 "episode/total_dishes": "max",
                 "episode/movement_ratio": "mean",

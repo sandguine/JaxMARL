@@ -1,4 +1,4 @@
-""" Wrappers for use with jaxmarl baselines. """
+""" Wrappers for use with jaxmarl baselines for logging and batching. """
 import os
 import jax
 import jax.numpy as jnp
@@ -9,7 +9,7 @@ from functools import partial
 
 # from gymnax.environments import environment, spaces
 from gymnax.environments.spaces import Box as BoxGymnax, Discrete as DiscreteGymnax
-from typing import Dict, Optional, List, Tuple, Union
+from typing import Dict, Optional, List, Tuple, Union, Any
 from jaxmarl.environments.spaces import Box, Discrete, MultiDiscrete
 from jaxmarl.environments.multi_agent_env import MultiAgentEnv, State
 
@@ -25,7 +25,21 @@ def load_params(filename:Union[str, os.PathLike]) -> Dict:
     return unflatten_dict(flattened_dict, sep=",")
 
 
-class JaxMARLWrapper(object):
+class MultiAgentWrapper:
+    def __init__(self, env):
+        self._env = env
+        
+    @property
+    def env(self):
+        return self._env
+        
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            raise AttributeError(f"attempted to get missing private attribute '{name}'")
+        return getattr(self._env, name)
+
+
+class JaxMARLWrapper(MultiAgentWrapper):
     """Base class for all jaxmarl wrappers."""
 
     def __init__(self, env: MultiAgentEnv):
@@ -59,34 +73,67 @@ class LogWrapper(JaxMARLWrapper):
     def __init__(self, env: MultiAgentEnv, replace_info: bool = False):
         super().__init__(env)
         self.replace_info = replace_info
+        self.num_agents = len(env.agents)
+
+    def _get_episode_returns(self, state, reward):
+        """Default implementation if environment doesn't provide one"""
+        try:
+            return self._env._get_episode_returns(state, reward)
+        except AttributeError:
+            # If environment doesn't track returns, just return zeros
+            return jnp.zeros(self.num_agents)
+
+    def _get_episode_lengths(self, state):
+        """Default implementation if environment doesn't provide one"""
+        try:
+            return self._env._get_episode_lengths(state)
+        except AttributeError:
+            # If environment doesn't track lengths, just return zeros
+            return jnp.zeros(self.num_agents)
+
+    def _convert_to_log_state(self, state, reward):
+        # If state is already LogEnvState, return as is
+        if isinstance(state, LogEnvState):
+            return state
+            
+        # Otherwise create new LogEnvState
+        return LogEnvState(
+            env_state=state,
+            episode_returns=self._get_episode_returns(state, reward),
+            episode_lengths=self._get_episode_lengths(state),
+            returned_episode_returns=jnp.zeros(self.num_agents),
+            returned_episode_lengths=jnp.zeros(self.num_agents)
+        )
 
     @partial(jax.jit, static_argnums=(0,))
-    def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, State]:
-        obs, env_state = self._env.reset(key)
-        state = LogEnvState(
-            env_state,
-            jnp.zeros((self._env.num_agents,)),
-            jnp.zeros((self._env.num_agents,)),
-            jnp.zeros((self._env.num_agents,)),
-            jnp.zeros((self._env.num_agents,)),
+    def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, LogEnvState]:
+        """Single reset method to avoid duplication."""
+        obs, state = self._env.reset(key)
+        log_state = LogEnvState(
+            env_state=state,
+            episode_returns=jnp.zeros((self.num_agents,)),
+            episode_lengths=jnp.zeros((self.num_agents,)),
+            returned_episode_returns=jnp.zeros((self.num_agents,)),
+            returned_episode_lengths=jnp.zeros((self.num_agents,)),
         )
-        return obs, state
+        return obs, log_state
 
     @partial(jax.jit, static_argnums=(0,))
     def step(
         self,
         key: chex.PRNGKey,
         state: LogEnvState,
-        action: Union[int, float],
+        actions: Union[int, float],
     ) -> Tuple[chex.Array, LogEnvState, float, bool, dict]:
-        obs, env_state, reward, done, info = self._env.step(
-            key, state.env_state, action
+        next_obs, next_state, reward, done, info = self.env.step(
+            key, state.env_state, actions
         )
         ep_done = done["__all__"]
         new_episode_return = state.episode_returns + self._batchify_floats(reward)
         new_episode_length = state.episode_lengths + 1
-        state = LogEnvState(
-            env_state=env_state,
+        
+        log_state = LogEnvState(
+            env_state=next_state,
             episode_returns=new_episode_return * (1 - ep_done),
             episode_lengths=new_episode_length * (1 - ep_done),
             returned_episode_returns=state.returned_episode_returns * (1 - ep_done)
@@ -94,12 +141,50 @@ class LogWrapper(JaxMARLWrapper):
             returned_episode_lengths=state.returned_episode_lengths * (1 - ep_done)
             + new_episode_length * ep_done,
         )
+        
         if self.replace_info:
             info = {}
-        info["returned_episode_returns"] = state.returned_episode_returns
-        info["returned_episode_lengths"] = state.returned_episode_lengths
-        info["returned_episode"] = jnp.full((self._env.num_agents,), ep_done)
-        return obs, state, reward, done, info
+        info["returned_episode_returns"] = log_state.returned_episode_returns
+        info["returned_episode_lengths"] = log_state.returned_episode_lengths
+        info["returned_episode"] = jnp.full((self.num_agents,), ep_done)
+        
+        return next_obs, log_state, reward, done, info
+
+    @property
+    def action_space(self) -> Union[Discrete, Box]:
+        """Get the environment's action space."""
+        return self._env.action_space()
+
+    @property
+    def observation_space(self) -> Union[Discrete, Box]:
+        """Get the environment's observation space."""
+        return self._env.observation_space()
+
+    @property
+    def num_agents(self) -> int:
+        """Get the number of agents in the environment."""
+        return len(self._env.agents)
+
+    @property
+    def agents(self) -> List[str]:
+        """Get the list of agent identifiers."""
+        return self._env.agents
+
+    def observation_space(self, agent: str) -> Union[Discrete, Box]:
+        """Get the observation space for a specific agent."""
+        return self._env.observation_space(agent)
+
+    def action_space(self, agent: str) -> Union[Discrete, Box]:
+        """Get the action space for a specific agent."""
+        return self._env.action_space(agent)
+
+    def state_space(self) -> Union[Discrete, Box]:
+        """Get the state space of the environment."""
+        return self._env.state_space()
+
+    def render(self, mode: str = "human") -> Optional[np.ndarray]:
+        """Render the environment."""
+        return self._env.render(mode)
 
 class MPELogWrapper(LogWrapper):
     """ Times reward signal by number of agents within the environment,

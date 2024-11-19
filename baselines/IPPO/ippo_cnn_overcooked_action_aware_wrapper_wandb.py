@@ -23,9 +23,16 @@ import hydra
 from omegaconf import OmegaConf
 import wandb
 import copy
+import logging
 
 import matplotlib.pyplot as plt
 
+# Set up logging at the top of the file
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 class CNN(nn.Module):
     activation: str = "tanh"
@@ -72,8 +79,6 @@ class ActorCritic(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        print("CNN input shape:", x.shape)  # Debug print
-
         if self.activation == "relu":
             activation = nn.relu
         else:
@@ -87,7 +92,7 @@ class ActorCritic(nn.Module):
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(embedding)
+        )(actor_mean)
         pi = distrax.Categorical(logits=actor_mean)
 
         critic = nn.Dense(
@@ -163,283 +168,327 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config):
-    """Create training function with environment setup and monitoring"""
-    # First create base environment
-    base_env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+def make_env(env_params, seed):
+    """Create environment with proper wrapper stack"""
+    # Create base environment
+    base_env = Overcooked(**env_params)
     
-    # Set NUM_ACTORS based on base environment
-    config["NUM_ACTORS"] = base_env.num_agents * config["NUM_ENVS"]
+    # Create wrapper chain
+    env = base_env
     
-    # Calculate NUM_UPDATES from TOTAL_TIMESTEPS
-    config["NUM_UPDATES"] = int(
-        config["TOTAL_TIMESTEPS"] // (config["NUM_STEPS"] * config["NUM_ENVS"])
-    )
+    # Add LogWrapper first
+    env = LogWrapper(env)
     
-    # Add action-aware wrapper if configured
-    use_action_aware = config.get("EXPERIMENT", {}).get("USE_ACTION_AWARE", False)
-    if use_action_aware:
-        env = ActionAwareWrapper(base_env)
-    else:
-        env = base_env
-    
-    # Add logging wrapper
-    env = LogWrapper(env, replace_info=False)
-    
-    # Handle both old and new config structures
-    wandb_config = {
-        "project": config.get("WANDB", {}).get("PROJECT", config.get("PROJECT")),
-        "entity": config.get("WANDB", {}).get("ENTITY", config.get("ENTITY")),
-        "mode": config.get("WANDB", {}).get("MODE", config.get("WANDB_MODE")),
-        "group": config.get("WANDB", {}).get("GROUP", "overcooked_experiments"),
-        "tags": config.get("WANDB", {}).get("TAGS", ["IPPO", "CNN"]),
-    }
-    
-    # Add WandB monitoring
+    # Add ActionAwareWrapper if configured
+    if env_params.get("use_action_aware", True):
+        env = ActionAwareWrapper(env)
+        
+    # Add WandbMonitorWrapper last
     env = WandbMonitorWrapper(
         env,
-        experiment_name=f"overcooked_{config['ENV_KWARGS']['layout']}_{'aa' if use_action_aware else 'baseline'}",
-        project=wandb_config["project"],
-        entity=wandb_config["entity"],
-        tags=wandb_config["tags"] + (["action_aware"] if use_action_aware else []),
-        group=wandb_config["group"],
-        config=config,
+        experiment_name=f"overcooked_{env_params['layout']}_{'aa' if env_params.get('use_action_aware', True) else 'baseline'}",
+        project=env_params.get("project", "action-aware"),
+        entity=env_params.get("entity", "sandily"),
     )
+    
+    return env
 
-    print("Observation space shape:", env.observation_space().shape)
 
-    rew_shaping_anneal = optax.linear_schedule(
-        init_value=1.,
-        end_value=0.,
-        transition_steps=config["REW_SHAPING_HORIZON"]
-    )
-
-    def linear_schedule(count):
-        frac = (
-            1.0
-            - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"]))
-            / config["NUM_UPDATES"]
+def compute_gae(traj_batch, gamma, gae_lambda):
+    """Compute Generalized Advantage Estimation (GAE)"""
+    # Implement GAE computation
+    advantages = []
+    returns = []
+    gae = 0.0
+    
+    for t in reversed(range(len(traj_batch.reward))):
+        if t == len(traj_batch.reward) - 1:
+            next_value = 0.0
+        else:
+            next_value = traj_batch.value[t + 1]
+            
+        delta = (
+            traj_batch.reward[t] 
+            + gamma * next_value * (1 - traj_batch.done[t]) 
+            - traj_batch.value[t]
         )
-        return config["LR"] * frac
-
-    def train(rng):
-
-        # INIT NETWORK - Note we use env.observation_space().shape which now includes the action channel
-        network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
-        rng, _rng = jax.random.split(rng)
         
-        # Initialize with the correct observation shape
-        obs_shape = env.observation_space().shape
-        init_x = jnp.zeros((1, *obs_shape))
-        print("Network initialization shape:", init_x.shape)
+        gae = delta + gamma * gae_lambda * (1 - traj_batch.done[t]) * gae
+        
+        advantages.insert(0, gae)
+        returns.insert(0, gae + traj_batch.value[t])
+    
+    return jnp.array(advantages), jnp.array(returns)
 
-        network_params = network.init(_rng, init_x)
+
+def check_convergence(returns_history, 
+                     window_size=100,        # Number of episodes to look at
+                     threshold=0.01,         # Relative improvement threshold
+                     patience=50):           # Number of windows to wait
+    """Check if training has converged based on returns history."""
+    if len(returns_history) < window_size * 2:
+        return False
+        
+    def get_window_mean(window):
+        return jnp.mean(jnp.array(window))
+    
+    # Compare consecutive windows
+    windows_no_improvement = 0
+    for i in range(len(returns_history) - window_size * 2):
+        window1 = returns_history[i:i + window_size]
+        window2 = returns_history[i + window_size:i + 2*window_size]
+        
+        mean1 = get_window_mean(window1)
+        mean2 = get_window_mean(window2)
+        
+        # Calculate relative improvement
+        relative_improvement = (mean2 - mean1) / (abs(mean1) + 1e-8)
+        
+        if relative_improvement < threshold:
+            windows_no_improvement += 1
+        else:
+            windows_no_improvement = 0
+            
+        # Check if we've had no improvement for long enough
+        if windows_no_improvement >= patience:
+            return True
+            
+    return False
+
+
+def make_train(config):
+    """Create training function with environment setup and monitoring"""
+    
+    def train(rng):
+        # Split RNG for different uses
+        key, key_env, key_net = jax.random.split(rng, 3)
+        
+        # Create environment with wrapper stack
+        env = make_env(config["ENV_KWARGS"], config["SEED"])
+        env = WandbMonitorWrapper(
+            env,
+            experiment_name=f"overcooked_{config['ENV_KWARGS']['layout']}_{'aa' if config['EXPERIMENT'].get('USE_ACTION_AWARE', False) else 'baseline'}",
+            project=config.get("WANDB", {}).get("PROJECT", config.get("PROJECT")),
+            entity=config.get("WANDB", {}).get("ENTITY", config.get("ENTITY")),
+            tags=config.get("WANDB", {}).get("TAGS", ["IPPO", "CNN"]) + (["action_aware"] if config['EXPERIMENT'].get('USE_ACTION_AWARE', False) else []),
+            group=config.get("WANDB", {}).get("GROUP", "overcooked_experiments"),
+            config=config,
+        )
+
+        # Update NUM_ACTORS based on environment
+        config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
+
+        # Initialize network and optimizer
+        network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+        
+        # Get initial network parameters
+        init_obs = jnp.zeros((1,) + env.observation_space().shape)
+        print("Network initialization shape:", init_obs.shape)
+        network_params = network.init(key_net, init_obs)
+
+        # Create train state with optimizer
         if config["ANNEAL_LR"]:
+            schedule = optax.linear_schedule(
+                init_value=config["LR"],
+                end_value=0.0,
+                transition_steps=config["NUM_UPDATES"],
+            )
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
+                optax.adam(learning_rate=schedule, eps=1e-5),
             )
         else:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(config["LR"], eps=1e-5),
             )
+        
         train_state = TrainState.create(
             apply_fn=network.apply,
             params=network_params,
             tx=tx,
         )
 
-        # INIT ENV
-        rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+        # Initialize environment states
+        obs, env_state = env.reset(key_env)
+        
+        # Initialize runner state
+        runner_state = (
+            train_state,
+            env_state,
+            obs,
+            key,
+        )
 
-        # TRAIN LOOP
-        def _update_step(runner_state, unused):
-            # COLLECT TRAJECTORIES
-            def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, update_step, rng = runner_state
-
-                # SELECT ACTION
-                rng, _rng = jax.random.split(rng)
-
-                obs_batch = jnp.stack([last_obs[a] for a in env.agents]).reshape(-1, *env.observation_space().shape)
-
-                print("input_obs_shape", obs_batch.shape)
-
+        returns_history = []
+        max_updates = config.get("MAX_UPDATES", 5000)
+        min_updates = config.get("MIN_UPDATES", 1000)
+        
+        # Training loop
+        def _update_step(runner_state, step_idx):
+            # Unpack runner state
+            train_state, env_state, obs, key = runner_state
+            
+            # Collect trajectories
+            def _env_step(carry, unused):
+                train_state, env_state, obs, key = carry
+                key, key_step = jax.random.split(key)
+                
+                # Stack observations for all agents
+                obs_batch = jnp.stack([obs[a] for a in env.agents])
+                
+                # Get actions from policy
                 pi, value = network.apply(train_state.params, obs_batch)
-                action = pi.sample(seed=_rng)
+                action = pi.sample(seed=key_step)
                 log_prob = pi.log_prob(action)
-                env_act = unbatchify(
-                    action, env.agents, config["NUM_ENVS"], env.num_agents
+                
+                # Convert actions to environment format
+                env_actions = unbatchify(action, env.agents, 1, env.num_agents)
+                env_actions = {k: v.squeeze() for k, v in env_actions.items()}
+                
+                # Step environment
+                next_obs, next_env_state, reward, done, info = env.step(
+                    key_step, env_state, env_actions
                 )
-
-                env_act = {k: v.flatten() for k, v in env_act.items()}
-
-                # STEP ENV
-                rng, _rng = jax.random.split(rng)
-                rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-
-                obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0)
-                )(rng_step, env_state, env_act)
-
-                shaped_reward = info.pop("shaped_reward")
-                current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
-                reward = jax.tree_util.tree_map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, shaped_reward)
-
-                info = jax.tree_util.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                
                 transition = Transition(
-                    batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    action,
-                    value,
-                    batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    log_prob,
-                    obs_batch,
-                    info,
+                    done=done,
+                    action=action,
+                    value=value,
+                    reward=reward,
+                    log_prob=log_prob,
+                    obs=obs_batch,
+                    info=info,
                 )
-                runner_state = (train_state, env_state, obsv, update_step, rng)
-                return runner_state, transition
-
+                
+                carry = (train_state, next_env_state, next_obs, key)
+                return carry, transition
+            
+            # Collect trajectories for NUM_STEPS
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
-
-            # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, update_step, rng = runner_state
-            last_obs_batch = jnp.stack([last_obs[a] for a in env.agents]).reshape(-1, *env.observation_space().shape)
-            _, last_val = network.apply(train_state.params, last_obs_batch)
-
-            def _calculate_gae(traj_batch, last_val):
-                def _get_advantages(gae_and_next_value, transition):
-                    gae, next_value = gae_and_next_value
-                    done, value, reward = (
-                        transition.done,
-                        transition.value,
-                        transition.reward,
-                    )
-                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value
-                    gae = (
-                        delta
-                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
-                    )
-                    return (gae, value), gae
-
-                _, advantages = jax.lax.scan(
-                    _get_advantages,
-                    (jnp.zeros_like(last_val), last_val),
-                    traj_batch,
-                    reverse=True,
-                    unroll=16,
-                )
-                return advantages, advantages + traj_batch.value
-
-            advantages, targets = _calculate_gae(traj_batch, last_val)
-
-            # UPDATE NETWORK
+            
+            # Update policy using PPO
             def _update_epoch(update_state, unused):
-                def _update_minbatch(train_state, batch_info):
+                def _update_minibatch(train_state, batch_info):
                     traj_batch, advantages, targets = batch_info
-
-                    def _loss_fn(params, traj_batch, gae, targets):
-                        # RERUN NETWORK
+                    
+                    def _loss_fn(params, traj_batch, advantages, targets):
+                        # Standard PPO loss computation
                         pi, value = network.apply(params, traj_batch.obs)
                         log_prob = pi.log_prob(traj_batch.action)
-
-                        # CALCULATE VALUE LOSS
-                        value_pred_clipped = traj_batch.value + (
-                            value - traj_batch.value
-                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                        value_losses = jnp.square(value - targets)
-                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = (
-                            0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
-                        )
-
-                        # CALCULATE ACTOR LOSS
+                        
+                        # Policy loss
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-                        loss_actor1 = ratio * gae
-                        loss_actor2 = (
-                            jnp.clip(
-                                ratio,
-                                1.0 - config["CLIP_EPS"],
-                                1.0 + config["CLIP_EPS"],
+                        clip_ratio = jnp.clip(ratio, 1 - config["CLIP_EPS"], 1 + config["CLIP_EPS"])
+                        policy_loss = -jnp.mean(
+                            jnp.minimum(
+                                ratio * advantages,
+                                clip_ratio * advantages,
                             )
-                            * gae
                         )
-                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                        loss_actor = loss_actor.mean()
-                        entropy = pi.entropy().mean()
-
+                        
+                        # Value loss
+                        value_loss = jnp.mean(jnp.square(value - targets))
+                        
+                        # Entropy loss
+                        entropy_loss = -jnp.mean(pi.entropy())
+                        
+                        # Total loss
                         total_loss = (
-                            loss_actor
-                            + config["VF_COEF"] * value_loss
-                            - config["ENT_COEF"] * entropy
+                            policy_loss 
+                            + config["VF_COEF"] * value_loss 
+                            + config["ENT_COEF"] * entropy_loss
                         )
-                        return total_loss, (value_loss, loss_actor, entropy)
-
+                        
+                        return total_loss, (policy_loss, value_loss, entropy_loss)
+                    
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    total_loss, grads = grad_fn(
+                    (total_loss, (policy_loss, value_loss, entropy_loss)), grads = grad_fn(
                         train_state.params, traj_batch, advantages, targets
                     )
+                    
                     train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
-
-                train_state, traj_batch, advantages, targets, rng = update_state
-                rng, _rng = jax.random.split(rng)
-                batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
-                assert (
-                    batch_size == config["NUM_STEPS"] * config["NUM_ACTORS"]
-                ), "batch size must be equal to number of steps * number of actors"
-                permutation = jax.random.permutation(_rng, batch_size)
-                batch = (traj_batch, advantages, targets)
-                batch = jax.tree_util.tree_map(
-                    lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
+                    
+                    metrics = {
+                        "total_loss": total_loss,
+                        "policy_loss": policy_loss,
+                        "value_loss": value_loss,
+                        "entropy_loss": entropy_loss,
+                    }
+                    
+                    return train_state, metrics
+                
+                train_state, traj_batch, advantages, targets = update_state
+                
+                # Update minibatches
+                train_state, metrics = jax.lax.scan(
+                    _update_minibatch,
+                    train_state,
+                    (traj_batch, advantages, targets),
+                    config["NUM_MINIBATCHES"],
                 )
-                shuffled_batch = jax.tree_util.tree_map(
-                    lambda x: jnp.take(x, permutation, axis=0), batch
-                )
-                minibatches = jax.tree_util.tree_map(
-                    lambda x: jnp.reshape(
-                        x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
-                    ),
-                    shuffled_batch,
-                )
-                train_state, total_loss = jax.lax.scan(
-                    _update_minbatch, train_state, minibatches
-                )
-                update_state = (train_state, traj_batch, advantages, targets, rng)
-                return update_state, total_loss
-
-            update_state = (train_state, traj_batch, advantages, targets, rng)
-            update_state, loss_info = jax.lax.scan(
+                
+                update_state = (train_state, traj_batch, advantages, targets)
+                return update_state, metrics
+            
+            # Compute advantages and returns
+            advantages, targets = compute_gae(
+                traj_batch,
+                config["GAMMA"],
+                config["GAE_LAMBDA"],
+            )
+            
+            # Update for multiple epochs
+            update_state = (train_state, traj_batch, advantages, targets)
+            update_state, metrics = jax.lax.scan(
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
+            
             train_state = update_state[0]
-            metric = traj_batch.info
-            rng = update_state[-1]
-
-            def callback(metric):
-                wandb.log(metric)
-
-            update_step = update_step + 1
-            metric = jax.tree_util.tree_map(lambda x: x.mean(), metric)
-            metric["update_step"] = update_step
-            metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-            jax.debug.callback(callback, metric)
-
-            runner_state = (train_state, env_state, last_obs, update_step, rng)
-            return runner_state, metric
-
-        rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, 0, _rng)
-        runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
-        )
-        return {"runner_state": runner_state, "metrics": metric}
-
+            runner_state = (train_state, env_state, obs, key)
+            
+            # Track episode returns
+            episode_return = metrics.get("episode_return", 0.0)
+            returns_history.append(episode_return)
+            
+            # Check for convergence after minimum updates
+            if step_idx > min_updates:
+                has_converged = check_convergence(
+                    returns_history,
+                    window_size=config.get("CONV_WINDOW_SIZE", 100),
+                    threshold=config.get("CONV_THRESHOLD", 0.01),
+                    patience=config.get("CONV_PATIENCE", 50)
+                )
+                
+                if has_converged:
+                    # Signal early stopping
+                    metrics["converged"] = True
+                    
+            return runner_state, metrics
+        
+        # Modified training loop with early stopping
+        final_state = runner_state
+        final_metrics = None
+        
+        for update_idx in range(max_updates):
+            runner_state, metrics = _update_step(runner_state, update_idx)
+            
+            if metrics.get("converged", False):
+                print(f"Training converged after {update_idx} updates")
+                break
+                
+            final_state = runner_state
+            final_metrics = metrics
+            
+        return {
+            "runner_state": final_state, 
+            "metrics": final_metrics,
+            "updates_used": update_idx + 1,
+            "returns_history": returns_history
+        }
+    
     return train
 
 def run_training(config):
@@ -460,66 +509,75 @@ def run_training(config):
 
 def single_run(config):
     """Run both baseline and action-aware experiments"""
-    config = OmegaConf.to_container(config)
-    layout_name = copy.deepcopy(config["ENV_KWARGS"]["layout"])
-    config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
-    
-    # Set default experiment config if not present
-    if "EXPERIMENT" not in config:
-        config["EXPERIMENT"] = {
-            "USE_ACTION_AWARE": True,
-            "RUN_BASELINE": True,
-            "SAVE_VIDEOS": True
-        }
-    
-    results = {}
-    
-    # Run baseline if configured
-    if config["EXPERIMENT"]["RUN_BASELINE"]:
-        baseline_config = copy.deepcopy(config)
-        baseline_config["EXPERIMENT"]["USE_ACTION_AWARE"] = False
-        results["baseline"] = run_training(baseline_config)
-    
-    # Run action-aware
-    action_config = copy.deepcopy(config)
-    action_config["EXPERIMENT"]["USE_ACTION_AWARE"] = True
-    results["action_aware"] = run_training(action_config)
-    
-    # Generate comparison visualizations
-    steps = range(len(baseline_results["returns"]))
-    wandb.log({
-        "comparison/returns": wandb.plot.line_series(
-            xs=steps,
-            ys=[baseline_results["returns"], action_aware_results["returns"]],
-            keys=["Baseline", "Action-Aware"],
-            title="Return Comparison",
-            xname="steps"
-        ),
-        "comparison/dishes": wandb.plot.line_series(
-            xs=steps,
-            ys=[baseline_results["dishes"], action_aware_results["dishes"]],
-            keys=["Baseline", "Action-Aware"],
-            title="Completed Dishes Comparison",
-            xname="steps"
-        ),
-        "comparison/collisions": wandb.plot.line_series(
-            xs=steps,
-            ys=[baseline_results["collisions"], action_aware_results["collisions"]],
-            keys=["Baseline", "Action-Aware"],
-            title="Agent Collisions Comparison",
-            xname="steps"
-        )
-    })
-    
-    # Save visualization of final policies
-    for run_type, results in [("baseline", baseline_results), ("action_aware", action_aware_results)]:
-        filename = f'{config["ENV_NAME"]}_{layout_name}_{run_type}_seed{config["SEED"]}'
-        train_state = jax.tree_util.tree_map(lambda x: x[0], results["runner_state"][0])
-        state_seq = get_rollout(train_state.params, config)
-        viz = OvercookedVisualizer()
-        viz.animate(state_seq, agent_view_size=5, filename=f"{filename}.gif")
-
-    return baseline_results, action_aware_results
+    try:
+        config = OmegaConf.to_container(config)
+        layout_name = copy.deepcopy(config["ENV_KWARGS"]["layout"])
+        config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
+        
+        results = {}
+        
+        # Run baseline if configured
+        if config["EXPERIMENT"]["RUN_BASELINE"]:
+            logger.info("Starting baseline run...")
+            baseline_config = copy.deepcopy(config)
+            baseline_config["EXPERIMENT"]["USE_ACTION_AWARE"] = False
+            results["baseline"] = run_training(baseline_config)
+            logger.info("Completed baseline run")
+        
+        # Run action-aware
+        logger.info("Starting action-aware run...")
+        action_config = copy.deepcopy(config)
+        action_config["EXPERIMENT"]["USE_ACTION_AWARE"] = True
+        results["action_aware"] = run_training(action_config)
+        logger.info("Completed action-aware run")
+        
+        # Log comparison metrics
+        try:
+            steps = range(len(results["baseline"]["returns"]))
+            wandb.log({
+                "comparison/returns": wandb.plot.line_series(
+                    xs=steps,
+                    ys=[results["baseline"]["returns"], results["action_aware"]["returns"]],
+                    keys=["Baseline", "Action-Aware"],
+                    title="Return Comparison",
+                    xname="steps"
+                ),
+                "comparison/dishes": wandb.plot.line_series(
+                    xs=steps,
+                    ys=[results["baseline"]["dishes"], results["action_aware"]["dishes"]],
+                    keys=["Baseline", "Action-Aware"],
+                    title="Completed Dishes Comparison",
+                    xname="steps"
+                ),
+                "comparison/collisions": wandb.plot.line_series(
+                    xs=steps,
+                    ys=[results["baseline"]["collisions"], results["action_aware"]["collisions"]],
+                    keys=["Baseline", "Action-Aware"],
+                    title="Agent Collisions Comparison",
+                    xname="steps"
+                )
+            })
+            logger.info("Successfully logged comparison metrics to wandb")
+        except Exception as e:
+            logger.error(f"Failed to log comparison metrics: {e}")
+        
+        # Generate visualizations
+        try:
+            for run_type, run_results in results.items():
+                filename = f'{config["ENV_NAME"]}_{layout_name}_{run_type}_seed{config["SEED"]}'
+                train_state = jax.tree_util.tree_map(lambda x: x[0], run_results["runner_state"][0])
+                state_seq = get_rollout(train_state.params, config)
+                viz = OvercookedVisualizer()
+                viz.animate(state_seq, agent_view_size=5, filename=f"{filename}.gif")
+            logger.info("Successfully generated visualizations")
+        except Exception as e:
+            logger.error(f"Failed to generate visualization: {e}")
+            
+        return results
+        
+    except Exception as e:
+        logger.error(f"Critical error in single_run: {e}")
+        raise
 
 
 def tune(default_config):

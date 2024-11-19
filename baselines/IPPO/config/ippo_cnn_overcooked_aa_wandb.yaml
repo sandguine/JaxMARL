@@ -15,6 +15,7 @@
 "REW_SHAPING_HORIZON": 2.5e6 # for how many timesteps add a shaping reward
 "ENV_KWARGS": 
   "layout" : "cramped_room"
+"NUM_UPDATES": 2500
 "ANNEAL_LR": True
 "SEED": 30
 "NUM_SEEDS": 1

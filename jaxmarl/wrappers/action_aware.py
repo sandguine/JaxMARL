@@ -6,8 +6,9 @@ from flax import struct
 from jaxmarl.environments import MultiAgentEnv
 from jaxmarl.environments import spaces
 from jaxmarl.environments.overcooked.overcooked import Actions
+from jaxmarl.wrappers.baselines import MultiAgentWrapper
 
-class ActionAwareWrapper(MultiAgentEnv):
+class ActionAwareWrapper(MultiAgentWrapper):
     """A wrapper that enhances the environment by adding co-player's previous actions 
     to each agent's observations. This helps agents learn to coordinate by being aware of their 
     partner's recent actions.
@@ -16,10 +17,8 @@ class ActionAwareWrapper(MultiAgentEnv):
     total number of channels equivalent to the original + 1 for co-player's action.
     """
     
-    def __init__(self, env: MultiAgentEnv):
-        # Initialize parent class with same number of agents as base environment
-        super().__init__(num_agents=env.num_agents)
-        # Store reference to base environment
+    def __init__(self, env):
+        super().__init__(env)
         self._env = env
         # Store list of agents
         self.agents = env.agents
