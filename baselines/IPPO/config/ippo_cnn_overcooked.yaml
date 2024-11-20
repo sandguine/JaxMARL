@@ -21,6 +21,6 @@
 "TUNE": False
 
 # WandB Params
-"ENTITY": ""
-"PROJECT": ""
+"ENTITY": "sandily"
+"PROJECT": "debug_cnn"
 "WANDB_MODE" : "online"
