@@ -68,6 +68,7 @@ class Transition(NamedTuple):
     reward: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
+    intended_actions: jnp.ndarray # Store Intended Actions
 
 def get_rollout(train_state, config):
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
@@ -222,6 +223,7 @@ def make_train(config):
                     batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
                     log_prob,
                     obs_batch,
+                    env_act,
                 )
                 runner_state = (train_state, env_state, obsv, update_step, rng)
                 return runner_state, (transition, info)
