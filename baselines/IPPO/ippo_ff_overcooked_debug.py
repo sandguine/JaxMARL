@@ -1,7 +1,9 @@
-""" 
-Based on PureJaxRL Implementation of PPO
+"""
+Implementation of Independent PPO (IPPO) for multi-agent environments.
+Based on PureJaxRL's PPO implementation but adapted for multi-agent scenarios.
 """
 
+# Core imports for JAX machine learning
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -11,52 +13,53 @@ from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
 import distrax
+
+# Environment and visualization imports
 from gymnax.wrappers.purerl import LogWrapper, FlattenObservationWrapper
 import jaxmarl
 from jaxmarl.wrappers.baselines import LogWrapper
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
+
+# Configuration and logging imports
 import hydra
 from omegaconf import OmegaConf
 import wandb
 
 import matplotlib.pyplot as plt
 
-class AugmentedActorCritic(nn.Module):
-    action_dim: Sequence[int]
-    activation: str = "tanh"
-    
-    @nn.compact
-    def __call__(self, x, is_augmented=False):
-        """
-        Args:
-            x: observation input
-            is_augmented: whether this is the augmented agent (Agent 0)
-        """
-        print(f"Network input shape: {x.shape}")
-        print(f"Is augmented: {is_augmented}")
+class ActorCritic(nn.Module):
+    """Neural network architecture implementing both policy (actor) and value function (critic)"""
+    action_dim: Sequence[int]  # Dimension of action space
+    activation: str = "tanh"   # Activation function to use
 
+    @nn.compact
+    def __call__(self, x):
+        print("network input x shape:", x.shape)  # Debug print for input shape
+        
+        # Select activation function based on config
         if self.activation == "relu":
             activation = nn.relu
         else:
             activation = nn.tanh
-            
-        # First layer handles different input sizes automatically
+
+        # Actor network - outputs action probabilities
         actor_mean = nn.Dense(
             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
-        print(f"After first Dense layer: {actor_mean.shape}")
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(
             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(actor_mean)
         actor_mean = activation(actor_mean)
+        # Final layer outputs logits for each possible action
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)
+        # Convert logits to categorical distribution
         pi = distrax.Categorical(logits=actor_mean)
 
-        # Value network
+        # Critic network - outputs value function estimate
         critic = nn.Dense(
             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
@@ -65,6 +68,7 @@ class AugmentedActorCritic(nn.Module):
             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(critic)
         critic = activation(critic)
+        # Final layer outputs single value estimate
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic
         )
@@ -73,22 +77,27 @@ class AugmentedActorCritic(nn.Module):
     
 
 class Transition(NamedTuple):
-    done: jnp.ndarray  # [2, batch_size]
-    action: jnp.ndarray  # [2, batch_size]
-    value: jnp.ndarray  # [2, batch_size]
-    reward: jnp.ndarray  # [2, batch_size]
-    log_prob: jnp.ndarray  # [2, batch_size]
-    obs: jnp.ndarray  # [2, batch_size, obs_dim]
+    """Container for storing experience transitions"""
+    done: jnp.ndarray      # Episode termination flag
+    action: jnp.ndarray    # Action taken
+    value: jnp.ndarray     # Value function estimate
+    reward: jnp.ndarray    # Reward received
+    log_prob: jnp.ndarray  # Log probability of action
+    obs: jnp.ndarray       # Observation
 
 def get_rollout(train_state, config):
+    """Generate a single episode rollout for visualization"""
+    # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     # env_params = env.default_params
     # env = LogWrapper(env)
 
-    network = AugmentedActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+    # Initialize network
+    network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
     key = jax.random.PRNGKey(0)
     key, key_r, key_a = jax.random.split(key, 3)
 
+    # Initialize observation
     init_x = jnp.zeros(env.observation_space().shape)
     init_x = init_x.flatten()
 
@@ -97,32 +106,45 @@ def get_rollout(train_state, config):
 
     done = False
 
+    # Reset environment and initialize tracking lists
     obs, state = env.reset(key_r)
     state_seq = [state]
     rewards = []
     shaped_rewards = []
+    
+    # Run episode until completion
     while not done:
         key, key_a0, key_a1, key_s = jax.random.split(key, 4)
 
         # obs_batch = batchify(obs, env.agents, config["NUM_ACTORS"])
         # breakpoint()
+
+        # Flatten observations for network input
         obs = {k: v.flatten() for k, v in obs.items()}
 
+        print("agent_0 obs shape:", obs["agent_0"].shape)
+        print("agent_1 obs shape:", obs["agent_1"].shape)
+
+        # Get actions from policy for both agents
         pi_0, _ = network.apply(network_params, obs["agent_0"])
         pi_1, _ = network.apply(network_params, obs["agent_1"])
 
         actions = {"agent_0": pi_0.sample(seed=key_a0), "agent_1": pi_1.sample(seed=key_a1)}
+        print("actions:", actions)
         # env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
         # env_act = {k: v.flatten() for k, v in env_act.items()}
 
-        # STEP ENV
+        # Step environment forward
         obs, state, reward, done, info = env.step(key_s, state, actions)
+        print("reward:", reward)
+        print("shaped reward:", info["shaped_reward"])
         done = done["__all__"]
         rewards.append(reward['agent_0'])
         shaped_rewards.append(info["shaped_reward"]['agent_0'])
 
         state_seq.append(state)
 
+    # Plot rewards for visualization
     from matplotlib import pyplot as plt
 
     plt.plot(rewards, label="reward")
@@ -134,17 +156,22 @@ def get_rollout(train_state, config):
     return state_seq
 
 def batchify(x: dict, agent_list, num_actors):
+    """Convert dict of agent observations to batched array"""
     x = jnp.stack([x[a] for a in agent_list])
     return x.reshape((num_actors, -1))
 
 
 def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
+    """Convert batched array back to dict of agent observations"""
     x = x.reshape((num_actors, num_envs, -1))
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 def make_train(config):
+    """Creates the main training function with the given config"""
+    # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
 
+    # Calculate key training parameters
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"] 
@@ -156,9 +183,11 @@ def make_train(config):
     env = LogWrapper(env, replace_info=False)
     
     def linear_schedule(count):
+        """Learning rate annealing schedule"""
         frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
         return config["LR"] * frac
     
+    # Schedule for annealing reward shaping
     rew_shaping_anneal = optax.linear_schedule(
         init_value=1.,
         end_value=0.,
@@ -166,17 +195,18 @@ def make_train(config):
     )
 
     def train(rng):
-
-        # INIT NETWORK
-        base_obs_dim = env.observation_space().shape[-1]
-        aug_obs_dim = base_obs_dim + env.action_space().n  # Add action space size for one-hot
-        network = AugmentedActorCritic(env.action_space().n)
+        """Main training loop"""
+        # Initialize network and optimizer
+        network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space().shape)
         
         init_x = init_x.flatten()
+        print("init_x shape:", init_x.shape)
         
         network_params = network.init(_rng, init_x)
+        
+        # Setup optimizer with optional learning rate annealing
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -190,7 +220,7 @@ def make_train(config):
             tx=tx,
         )
         
-        # INIT ENV
+        # Initialize environment states
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
@@ -200,79 +230,52 @@ def make_train(config):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, update_step, rng = runner_state
-                
-                # Debug observation shapes
+
+                # SELECT ACTION
+                rng, _rng = jax.random.split(rng)
+
                 print("Initial observation shapes:")
                 print(f"agent_0 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_0'])}")
                 print(f"agent_1 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_1'])}")
 
-                # Split RNG for different random operations
-                rng, key_a0, key_a1, key_step = jax.random.split(rng, 4)
+                obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
 
-                # 1. Agent 1 (co-player) acts first with regular observation
-                obs_1_batch = batchify(last_obs, ["agent_1"], config["NUM_ACTORS"])
-                # Debug after batchify
-                print(f"Batched obs_1 shape: {obs_1_batch.shape}")
-                pi_1, value_1 = network.apply(
-                    train_state.params, 
-                    obs_1_batch,
-                    is_augmented=False
-                )
-                action_1 = pi_1.sample(seed=key_a1)
-                # Debug action space
-                print(f"Action space size: {env.action_space().n}")
-                log_prob_1 = pi_1.log_prob(action_1)
-
-                # 2. Prepare augmented observation for Agent 0
-                obs_0_batch = batchify(last_obs, ["agent_0"], config["NUM_ACTORS"])
-                action_1_onehot = jax.vmap(lambda a: jax.nn.one_hot(a, env.action_space().n))(action_1)
-                print(f"obs_0_batch shape: {obs_0_batch.shape}")
-                print(f"action_1_onehot shape: {action_1_onehot.shape}")
+                print("obs_batch shape:", obs_batch.shape)
                 
-                aug_obs_0 = jnp.concatenate([obs_0_batch, action_1_onehot], axis=-1)
-                print(f"Augmented obs_0 shape: {aug_obs_0.shape}")
-
-                # 3. Agent 0 acts with knowledge of Agent 1's action
-                pi_0, value_0 = network.apply(
-                    train_state.params, 
-                    aug_obs_0,
-                    is_augmented=True
-                )
-                action_0 = pi_0.sample(seed=key_a0)
-                log_prob_0 = pi_0.log_prob(action_0)
-
-                # Package actions and step environment
-                action = jnp.stack([action_0, action_1])
+                pi, value = network.apply(train_state.params, obs_batch)
+                action = pi.sample(seed=_rng)
+                print("action shape:", action.shape)
+                print("action:", action)
+                log_prob = pi.log_prob(action)
                 env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
-
-                # Step environment
-                rng_step = jax.random.split(key_step, config["NUM_ENVS"])
+                
+                env_act = {k:v.flatten() for k,v in env_act.items()}
+                print("env_act:", env_act)
+                
+                # STEP ENV
+                rng, _rng = jax.random.split(rng)
+                rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+                
                 obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0,0,0))(
                     rng_step, env_state, env_act
                 )
 
-                # Handle reward shaping
-                current_timestep = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-                reward = jax.tree_util.tree_map(
-                    lambda x, y: x + y * rew_shaping_anneal(current_timestep), 
-                    reward, 
-                    info["shaped_reward"]
-                )
+                print("reward:", reward)
+                print("shaped reward:", info["shaped_reward"])
 
-                # Create transition with both regular and augmented observations
-                obs_batch = jnp.stack([aug_obs_0, obs_1_batch])
-                value_batch = jnp.stack([value_0, value_1])
-                log_prob_batch = jnp.stack([log_prob_0, log_prob_1])
-                
+                info["reward"] = reward["agent_0"]
+
+                current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
+                reward = jax.tree_util.tree_map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, info["shaped_reward"])
+
                 transition = Transition(
-                    done=batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    action=action,
-                    value=value_batch,
-                    reward=batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    log_prob=log_prob_batch,
-                    obs=obs_batch,
+                    batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    action,
+                    value,
+                    batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    log_prob,
+                    obs_batch,
                 )
-
                 runner_state = (train_state, env_state, obsv, update_step, rng)
                 return runner_state, (transition, info)
 
@@ -313,12 +316,11 @@ def make_train(config):
             
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
-                def _update_minibatch(train_state, batch_info):
+                def _update_minbatch(train_state, batch_info):
                     traj_batch, advantages, targets = batch_info
 
                     def _loss_fn(params, traj_batch, gae, targets):
                         # RERUN NETWORK
-                        # Note: traj_batch.obs is already stacked as [aug_obs_0, obs_1]
                         pi, value = network.apply(params, traj_batch.obs)
                         log_prob = pi.log_prob(traj_batch.action)
 
@@ -334,10 +336,7 @@ def make_train(config):
 
                         # CALCULATE ACTOR LOSS
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                        
-                        # Normalize advantages per agent
-                        gae = (gae - gae.mean(0)) / (gae.std(0) + 1e-8)
-                        
+                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -349,8 +348,6 @@ def make_train(config):
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
-                        
-                        # Calculate entropy separately for each agent
                         entropy = pi.entropy().mean()
 
                         total_loss = (
@@ -376,27 +373,20 @@ def make_train(config):
                 permutation = jax.random.permutation(_rng, batch_size)
                 batch = (traj_batch, advantages, targets)
                 batch = jax.tree_util.tree_map(
-                    lambda x: x.reshape((batch_size,) + x.shape[2:]), 
-                    batch
+                    lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
                 )
                 shuffled_batch = jax.tree_util.tree_map(
-                    lambda x: jnp.take(x, permutation, axis=0), 
-                    batch
+                    lambda x: jnp.take(x, permutation, axis=0), batch
                 )
-                
-                # Split into minibatches
                 minibatches = jax.tree_util.tree_map(
                     lambda x: jnp.reshape(
-                        x, 
-                        [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
+                        x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
                     ),
                     shuffled_batch,
                 )
-
                 train_state, total_loss = jax.lax.scan(
-                    _update_minibatch, train_state, minibatches
+                    _update_minbatch, train_state, minibatches
                 )
-                
                 update_state = (train_state, traj_batch, advantages, targets, rng)
                 return update_state, total_loss
 
@@ -438,10 +428,13 @@ def make_train(config):
 
 @hydra.main(version_base=None, config_path="config", config_name="ippo_ff_overcooked")
 def main(config):
+    """Main entry point for training"""
+    # Process config
     config = OmegaConf.to_container(config) 
     layout_name = config["ENV_KWARGS"]["layout"]
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
 
+    # Initialize wandb logging
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
@@ -451,11 +444,13 @@ def main(config):
         name=f'ippo_ff_overcooked_{layout_name}'
     )
 
+    # Setup random seeds and training
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])    
     train_jit = jax.jit(make_train(config))
     out = jax.vmap(train_jit)(rngs)
 
+    # Generate visualization
     filename = f'{config["ENV_NAME"]}_{layout_name}'
     train_state = jax.tree_util.tree_map(lambda x: x[0], out["runner_state"][0])
     state_seq = get_rollout(train_state, config)
