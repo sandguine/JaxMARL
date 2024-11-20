@@ -25,13 +25,34 @@ import matplotlib.pyplot as plt
 class ActorCritic(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
+    agent_type: str = "partner"  # "ego" or "partner"
 
     @nn.compact
     def __call__(self, x):
+        # Set activation function
         if self.activation == "relu":
             activation = nn.relu
         else:
             activation = nn.tanh
+
+        # Handle ego agent's special input processing
+        if self.agent_type == "ego":
+            # Calculate state dimension
+            state_dim = x.shape[-1] - self.action_dim
+            
+            # Handle both single and batched inputs
+            if x.ndim == 1:
+                # Single observation case
+                state = x[:state_dim]
+                partner_action = x[state_dim:]
+                x = jnp.concatenate([state, partner_action])
+            else:
+                # Batched observation case
+                state = x[:, :state_dim]
+                partner_action = x[:, state_dim:]
+                x = jnp.concatenate([state, partner_action], axis=-1)
+
+        # Actor network
         actor_mean = nn.Dense(
             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
@@ -70,56 +91,88 @@ class Transition(NamedTuple):
 
 def get_rollout(train_state, config):
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
-    # env_params = env.default_params
-    # env = LogWrapper(env)
 
-    network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+    # Initialize networks with correct agent types
+    partner_network = ActorCritic(
+        env.action_space().n,
+        activation=config["ACTIVATION"],
+        agent_type="partner"
+    )
+    ego_network = ActorCritic(
+        env.action_space().n,
+        activation=config["ACTIVATION"],
+        agent_type="ego"
+    )
+
+    # Initial key splits for reset and action sequence
     key = jax.random.PRNGKey(0)
     key, key_r, key_a = jax.random.split(key, 3)
 
-    init_x = jnp.zeros(env.observation_space().shape)
-    init_x = init_x.flatten()
-
-    network.init(key_a, init_x)
-    network_params = train_state.params
-
-    done = False
-
+    # Reset environment
     obs, state = env.reset(key_r)
+    
+    # Initialize trajectory storage
     state_seq = [state]
+    obs_seq = [obs]
+    action_seq = []
     rewards = []
     shaped_rewards = []
-    while not done:
-        key, key_a0, key_a1, key_s = jax.random.split(key, 4)
+    done = False
 
-        # obs_batch = batchify(obs, env.agents, config["NUM_ACTORS"])
-        # breakpoint()
+    while not done:
+        # Split keys for partner action, ego action, and environment step
+        key_partner, key_ego, key_env = jax.random.split(key_a, 3)
+        
+        # Flatten observations
         obs = {k: v.flatten() for k, v in obs.items()}
 
-        pi_0, _ = network.apply(network_params, obs["agent_0"])
-        pi_1, _ = network.apply(network_params, obs["agent_1"])
+        # 1. Partner agent acts first
+        pi_partner, _ = partner_network.apply(train_state.params, obs["agent_1"])
+        partner_action = pi_partner.sample(seed=key_partner)
 
-        actions = {"agent_0": pi_0.sample(seed=key_a0), "agent_1": pi_1.sample(seed=key_a1)}
-        # env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
-        # env_act = {k: v.flatten() for k, v in env_act.items()}
+        # 2. Ego agent acts with augmented observation
+        ego_obs = obs["agent_0"]
+        partner_action_onehot = jax.nn.one_hot(partner_action, env.action_space().n)
+        ego_obs_augmented = jnp.concatenate([ego_obs, partner_action_onehot])
 
-        # STEP ENV
-        obs, state, reward, done, info = env.step(key_s, state, actions)
+        pi_ego, _ = ego_network.apply(train_state.params, ego_obs_augmented)
+        ego_action = pi_ego.sample(seed=key_ego)
+
+        # Combine actions
+        actions = {
+            "agent_0": ego_action,
+            "agent_1": partner_action
+        }
+
+        # Step environment
+        obs, state, reward, done, info = env.step(key_env, state, actions)
         done = done["__all__"]
+        
+        # Store trajectory information
+        state_seq.append(state)
+        obs_seq.append(obs)
+        action_seq.append(actions)
         rewards.append(reward['agent_0'])
         shaped_rewards.append(info["shaped_reward"]['agent_0'])
 
-        state_seq.append(state)
+        # Update key_a for next iteration
+        key_a = key_env
 
+    # Visualization
     from matplotlib import pyplot as plt
-
     plt.plot(rewards, label="reward")
     plt.plot(shaped_rewards, label="shaped_reward")
     plt.legend()
     plt.savefig("reward.png")
-    plt.show()
+    plt.close()
 
-    return state_seq
+    return {
+        "state_seq": state_seq,
+        "obs_seq": obs_seq,
+        "action_seq": action_seq,
+        "rewards": rewards,
+        "shaped_rewards": shaped_rewards,
+    }
 
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
@@ -154,25 +207,52 @@ def make_train(config):
     )
 
     def train(rng):
+        # INIT NETWORKS
+        partner_network = ActorCritic(
+            action_dim=env.action_space().n,
+            activation=config["ACTIVATION"],
+            agent_type="partner"
+        )
+        ego_network = ActorCritic(
+            action_dim=env.action_space().n,
+            activation=config["ACTIVATION"],
+            agent_type="ego"
+        )
 
-        # INIT NETWORK
-        network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+        # Initialize observation space
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space().shape)
-        
         init_x = init_x.flatten()
-        
-        network_params = network.init(_rng, init_x)
+
+        # Initialize network parameters
+        rng, init_rng_partner, init_rng_ego = jax.random.split(rng, 3)
+        partner_params = partner_network.init(init_rng_partner, init_x)
+        ego_params = ego_network.init(
+            init_rng_ego,
+            jnp.concatenate([init_x, jnp.zeros(env.action_space().n)])
+        )
+
+        # Setup optimizers
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(learning_rate=linear_schedule, eps=1e-5),
             )
         else:
-            tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["LR"], eps=1e-5))
-        train_state = TrainState.create(
-            apply_fn=network.apply,
-            params=network_params,
+            tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(config["LR"], eps=1e-5)
+            )
+
+        # Create train states for both networks
+        partner_train_state = TrainState.create(
+            apply_fn=partner_network.apply,
+            params=partner_params,
+            tx=tx,
+        )
+        ego_train_state = TrainState.create(
+            apply_fn=ego_network.apply,
+            params=ego_params,
             tx=tx,
         )
         
@@ -185,44 +265,63 @@ def make_train(config):
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, update_step, rng = runner_state
+                partner_train_state, ego_train_state, env_state, last_obs, update_step, rng = runner_state
 
-                # SELECT ACTION
-                rng, _rng = jax.random.split(rng)
+                # SELECT ACTIONS SEQUENTIALLY
+                rng, key_partner, key_ego = jax.random.split(rng, 3)
 
-                obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+                # 1. Partner agent acts first
+                partner_obs = batchify(last_obs, ["agent_1"], config["NUM_ACTORS"])
+                pi_partner, value_partner = partner_network.apply(
+                    partner_train_state.params,
+                    partner_obs
+                )
+                partner_action = pi_partner.sample(seed=key_partner)
+                partner_log_prob = pi_partner.log_prob(partner_action)
 
-                print("obs_shape", obs_batch.shape)
-                
-                pi, value = network.apply(train_state.params, obs_batch)
-                action = pi.sample(seed=_rng)
-                log_prob = pi.log_prob(action)
+                # 2. Ego agent acts with augmented observation
+                ego_obs = batchify(last_obs, ["agent_0"], config["NUM_ACTORS"])
+                partner_action_onehot = jax.nn.one_hot(partner_action, env.action_space().n)
+                ego_obs_augmented = jnp.concatenate([ego_obs, partner_action_onehot], axis=-1)
+
+                pi_ego, value_ego = ego_network.apply(
+                    ego_train_state.params,
+                    ego_obs_augmented
+                )
+                ego_action = pi_ego.sample(seed=key_ego)
+                ego_log_prob = pi_ego.log_prob(ego_action)
+
+                # Combine actions
+                action = jnp.stack([ego_action, partner_action])
                 env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
-                
-                env_act = {k:v.flatten() for k,v in env_act.items()}
-                
+                env_act = {k: v.flatten() for k, v in env_act.items()}
+
                 # STEP ENV
-                rng, _rng = jax.random.split(rng)
-                rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                
+                rng, key_step = jax.random.split(rng)
+                rng_step = jax.random.split(key_step, config["NUM_ENVS"])
                 obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0,0,0))(
                     rng_step, env_state, env_act
                 )
 
                 info["reward"] = reward["agent_0"]
-
-                current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
-                reward = jax.tree_util.tree_map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, info["shaped_reward"])
-
-                transition = Transition(
-                    batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    action,
-                    value,
-                    batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    log_prob,
-                    obs_batch,
+                current_timestep = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
+                reward = jax.tree_util.tree_map(
+                    lambda x, y: x + y * rew_shaping_anneal(current_timestep),
+                    reward,
+                    info["shaped_reward"]
                 )
-                runner_state = (train_state, env_state, obsv, update_step, rng)
+
+                # Create transition for both agents
+                transition = Transition(
+                    done=batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    action=action,
+                    value=jnp.stack([value_ego, value_partner]),
+                    reward=batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    log_prob=jnp.stack([ego_log_prob, partner_log_prob]),
+                    obs=jnp.stack([ego_obs_augmented, partner_obs])
+                )
+
+                runner_state = (partner_train_state, ego_train_state, env_state, obsv, update_step, rng)
                 return runner_state, (transition, info)
 
             runner_state, (traj_batch, info) = jax.lax.scan(
@@ -230,9 +329,21 @@ def make_train(config):
             )
             
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, update_step, rng = runner_state
-            last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
-            _, last_val = network.apply(train_state.params, last_obs_batch)
+            partner_train_state, ego_train_state, env_state, last_obs, update_step, rng = runner_state
+            
+            # Calculate last values for both agents
+            partner_obs = batchify(last_obs, ["agent_1"], config["NUM_ACTORS"])
+            ego_obs = batchify(last_obs, ["agent_0"], config["NUM_ACTORS"])
+            
+            # For ego agent, we need partner's last action (using zero action as placeholder)
+            ego_obs_augmented = jnp.concatenate([
+                ego_obs,
+                jnp.zeros((ego_obs.shape[0], env.action_space().n))
+            ], axis=-1)
+            
+            _, last_val_partner = partner_network.apply(partner_train_state.params, partner_obs)
+            _, last_val_ego = ego_network.apply(ego_train_state.params, ego_obs_augmented)
+            last_val = jnp.stack([last_val_ego, last_val_partner])
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -262,35 +373,36 @@ def make_train(config):
             
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
-                def _update_minbatch(train_state, batch_info):
+                def _update_minibatch(train_states, batch_info):
+                    partner_train_state, ego_train_state = train_states
                     traj_batch, advantages, targets = batch_info
 
-                    def _loss_fn(params, traj_batch, gae, targets):
+                    def _loss_fn(params, network, traj_batch, gae, targets, agent_idx):
                         # RERUN NETWORK
-                        pi, value = network.apply(params, traj_batch.obs)
-                        log_prob = pi.log_prob(traj_batch.action)
+                        pi, value = network.apply(params, traj_batch.obs[agent_idx])
+                        log_prob = pi.log_prob(traj_batch.action[agent_idx])
 
                         # CALCULATE VALUE LOSS
-                        value_pred_clipped = traj_batch.value + (
-                            value - traj_batch.value
+                        value_pred_clipped = traj_batch.value[agent_idx] + (
+                            value - traj_batch.value[agent_idx]
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                        value_losses = jnp.square(value - targets)
-                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
+                        value_losses = jnp.square(value - targets[agent_idx])
+                        value_losses_clipped = jnp.square(value_pred_clipped - targets[agent_idx])
                         value_loss = (
                             0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                         )
 
                         # CALCULATE ACTOR LOSS
-                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-                        loss_actor1 = ratio * gae
+                        ratio = jnp.exp(log_prob - traj_batch.log_prob[agent_idx])
+                        gae_agent = (gae[agent_idx] - gae[agent_idx].mean()) / (gae[agent_idx].std() + 1e-8)
+                        loss_actor1 = ratio * gae_agent
                         loss_actor2 = (
                             jnp.clip(
                                 ratio,
                                 1.0 - config["CLIP_EPS"],
                                 1.0 + config["CLIP_EPS"],
                             )
-                            * gae
+                            * gae_agent
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
@@ -303,19 +415,29 @@ def make_train(config):
                         )
                         return total_loss, (value_loss, loss_actor, entropy)
 
-                    grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    total_loss, grads = grad_fn(
-                        train_state.params, traj_batch, advantages, targets
+                    # Update partner network
+                    grad_fn_partner = jax.value_and_grad(_loss_fn, has_aux=True)
+                    total_loss_partner, grads_partner = grad_fn_partner(
+                        partner_train_state.params, partner_network, traj_batch, advantages, targets, 1
                     )
-                    train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
+                    partner_train_state = partner_train_state.apply_gradients(grads=grads_partner)
 
-                train_state, traj_batch, advantages, targets, rng = update_state
+                    # Update ego network
+                    grad_fn_ego = jax.value_and_grad(_loss_fn, has_aux=True)
+                    total_loss_ego, grads_ego = grad_fn_ego(
+                        ego_train_state.params, ego_network, traj_batch, advantages, targets, 0
+                    )
+                    ego_train_state = ego_train_state.apply_gradients(grads=grads_ego)
+
+                    return (partner_train_state, ego_train_state), (total_loss_partner, total_loss_ego)
+
+                train_states, traj_batch, advantages, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
                 batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
                 assert (
                     batch_size == config["NUM_STEPS"] * config["NUM_ACTORS"]
                 ), "batch size must be equal to number of steps * number of actors"
+                
                 permutation = jax.random.permutation(_rng, batch_size)
                 batch = (traj_batch, advantages, targets)
                 batch = jax.tree_util.tree_map(
@@ -330,45 +452,45 @@ def make_train(config):
                     ),
                     shuffled_batch,
                 )
-                train_state, total_loss = jax.lax.scan(
-                    _update_minbatch, train_state, minibatches
+                
+                train_states, total_loss = jax.lax.scan(
+                    _update_minibatch, train_states, minibatches
                 )
-                update_state = (train_state, traj_batch, advantages, targets, rng)
+                
+                update_state = (train_states, traj_batch, advantages, targets, rng)
                 return update_state, total_loss
 
-            update_state = (train_state, traj_batch, advantages, targets, rng)
+            update_state = ((partner_train_state, ego_train_state), traj_batch, advantages, targets, rng)
             update_state, loss_info = jax.lax.scan(
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
-            train_state = update_state[0]
+            
+            partner_train_state, ego_train_state = update_state[0]
             metric = info
-            current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
+            current_timestep = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
             metric["shaped_reward"] = metric["shaped_reward"]["agent_0"]
-            metric["shaped_reward_annealed"] = metric["shaped_reward"]*rew_shaping_anneal(current_timestep)
+            metric["shaped_reward_annealed"] = metric["shaped_reward"] * rew_shaping_anneal(current_timestep)
             
             rng = update_state[-1]
 
             def callback(metric):
-                wandb.log(
-                    metric
-                )
+                wandb.log(metric)
+                
             update_step = update_step + 1
             metric = jax.tree_util.tree_map(lambda x: x.mean(), metric)
             metric["update_step"] = update_step
-            metric["env_step"] = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
+            metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
             jax.debug.callback(callback, metric)
             
-            runner_state = (train_state, env_state, last_obs, update_step, rng)
+            runner_state = (partner_train_state, ego_train_state, env_state, obsv, update_step, rng)
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, 0, _rng)
+        runner_state = (partner_train_state, ego_train_state, env_state, obsv, 0, _rng)
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
         return {"runner_state": runner_state, "metrics": metric}
-
-    return train
 
 
 
@@ -381,7 +503,7 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "FF"],
+        tags=["IPPO", "FF", "RE_ACTION"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f'ippo_ff_overcooked_{layout_name}'

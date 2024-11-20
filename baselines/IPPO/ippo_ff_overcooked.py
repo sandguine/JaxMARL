@@ -28,6 +28,7 @@ class ActorCritic(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+        # print("network input x shape:", x.shape)
         if self.activation == "relu":
             activation = nn.relu
         else:
@@ -192,7 +193,7 @@ def make_train(config):
 
                 obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
 
-                print("obs_shape", obs_batch.shape)
+                print("obs_batch shape:", obs_batch.shape)
                 
                 pi, value = network.apply(train_state.params, obs_batch)
                 action = pi.sample(seed=_rng)

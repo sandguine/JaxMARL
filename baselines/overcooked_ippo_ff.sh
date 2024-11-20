@@ -8,4 +8,5 @@
 #SBATCH --qos=default
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.9
-python baselines/IPPO/ippo_ff_overcooked.py
+# python baselines/IPPO/ippo_ff_overcooked.py
+python baselines/IPPO/ippo_ff_overcooked_re_action.py
