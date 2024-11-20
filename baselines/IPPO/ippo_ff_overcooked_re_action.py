@@ -253,7 +253,7 @@ def make_train(config):
 
                 # Handle reward shaping
                 current_timestep = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-                reward = jax.tree_util.tree_map(
+                reward = jax.tree.map(
                     lambda x, y: x + y * rew_shaping_anneal(current_timestep), 
                     reward, 
                     info["shaped_reward"]
@@ -375,17 +375,17 @@ def make_train(config):
                 ), "batch size must be equal to number of steps * number of actors"
                 permutation = jax.random.permutation(_rng, batch_size)
                 batch = (traj_batch, advantages, targets)
-                batch = jax.tree_util.tree_map(
+                batch = jax.tree.map(
                     lambda x: x.reshape((batch_size,) + x.shape[2:]), 
                     batch
                 )
-                shuffled_batch = jax.tree_util.tree_map(
+                shuffled_batch = jax.tree.map(
                     lambda x: jnp.take(x, permutation, axis=0), 
                     batch
                 )
                 
                 # Split into minibatches
-                minibatches = jax.tree_util.tree_map(
+                minibatches = jax.tree.map(
                     lambda x: jnp.reshape(
                         x, 
                         [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
@@ -417,7 +417,7 @@ def make_train(config):
                     metric
                 )
             update_step = update_step + 1
-            metric = jax.tree_util.tree_map(lambda x: x.mean(), metric)
+            metric = jax.tree.map(lambda x: x.mean(), metric)
             metric["update_step"] = update_step
             metric["env_step"] = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
             jax.debug.callback(callback, metric)
@@ -457,7 +457,7 @@ def main(config):
     out = jax.vmap(train_jit)(rngs)
 
     filename = f'{config["ENV_NAME"]}_{layout_name}'
-    train_state = jax.tree_util.tree_map(lambda x: x[0], out["runner_state"][0])
+    train_state = jax.tree.map(lambda x: x[0], out["runner_state"][0])
     state_seq = get_rollout(train_state, config)
     viz = OvercookedVisualizer()
     # agent_view_size is hardcoded as it determines the padding around the layout.
@@ -479,7 +479,7 @@ def main(config):
     plt.savefig(f'{filename}.png')
 
     # animate first seed
-    train_state = jax.tree_util.tree_map(lambda x: x[0], out["runner_state"][0])
+    train_state = jax.tree.map(lambda x: x[0], out["runner_state"][0])
     state_seq = get_rollout(train_state, config)
     viz = OvercookedVisualizer()
     # agent_view_size is hardcoded as it determines the padding around the layout.
