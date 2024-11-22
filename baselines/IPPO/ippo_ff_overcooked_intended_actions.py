@@ -84,6 +84,7 @@ class Transition(NamedTuple):
     reward: jnp.ndarray    # Reward received
     log_prob: jnp.ndarray  # Log probability of action
     obs: jnp.ndarray       # Observation
+    intended_actions: jnp.ndarray  # Intended actions
 
 def get_rollout(train_state, config):
     """Generate a single episode rollout for visualization with intended action augmentation"""
@@ -91,19 +92,10 @@ def get_rollout(train_state, config):
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     # env_params = env.default_params
     # env = LogWrapper(env)
-
-    # Initialize network
-    network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
     
     # Initialize random keys
     key = jax.random.PRNGKey(0)
     key, key_r, key_a = jax.random.split(key, 3)
-
-    # Initialize observation
-    init_x = jnp.zeros(env.observation_space().shape)
-    init_x = init_x.flatten()
-    network.init(key_a, init_x)
-    network_params = train_state.params
 
     # Reset environment and initialize tracking lists
     obs, state = env.reset(key_r)
@@ -173,57 +165,115 @@ def get_rollout(train_state, config):
 
     return state_seq
 
-def batchify(x: dict, agent_list, num_actors):
-    """Convert dict of agent observations to batched array"""
-    x = jnp.stack([x[a] for a in agent_list])
-    return x.reshape((num_actors, -1))
+def batchify(obs_dict, agents, batch_size, num_actors, num_envs,dummy_value=0):
+    """Batchify observations with augmentation for intended actions"""
+    observations = []
+    for agent in agents:
+        # Get original flattened observation size
+        flat_obs = obs_dict[agent].flatten()
+        orig_size = flat_obs.shape[0]
+        
+        # Reshape to (num_envs, orig_size)
+        reshaped_obs = flat_obs.reshape(num_envs, -1)
+        
+        # Add dummy value for intended action
+        aug_obs = jnp.concatenate([
+            reshaped_obs, 
+            jnp.ones((num_envs, 1)) * dummy_value
+        ], axis=1)
+        
+        observations.append(aug_obs)
+    
+    # Stack agents and reshape to batch size
+    observations = jnp.stack(observations)  # Shape: (num_agents, num_envs, aug_size)
+    observations = observations.transpose(1, 0, 2)  # Shape: (num_envs, num_agents, aug_size)
+    return observations.reshape(batch_size, -1)  # Shape: (batch_size, aug_size)
 
-
-def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
-    """Convert batched array back to dict of agent observations"""
-    x = x.reshape((num_actors, num_envs, -1))
-    return {a: x[i] for i, a in enumerate(agent_list)}
+def unbatchify(batch, agents, num_envs, num_agents, remove_augmentation=True):
+    """Unbatchify observations and optionally remove augmentation"""
+    aug_size = config["ORIG_OBS_SIZE"] + 1 if not remove_augmentation else config["ORIG_OBS_SIZE"]
+    
+    # Reshape batch to (num_envs, num_agents, feature_size)
+    batch = batch.reshape(num_envs, num_agents, -1)
+    
+    # Create dictionary for each agent
+    result = {}
+    for i, agent in enumerate(agents):
+        if remove_augmentation:
+            # Remove the last element (augmentation)
+            result[agent] = batch[:, i, :-1]
+        else:
+            result[agent] = batch[:, i, :]
+    
+    return result
 
 def make_train(config):
     """Creates the main training function with the given config"""
-    # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
-
-    # Calculate key training parameters
+    
+    # Calculate training parameters
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
-        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"] 
+        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
     config["MINIBATCH_SIZE"] = (
-        config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
-    )
-    
-    env = LogWrapper(env, replace_info=False)
-    
-    def linear_schedule(count):
-        """Learning rate annealing schedule"""
-        frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
-        return config["LR"] * frac
-    
-    # Schedule for annealing reward shaping
-    rew_shaping_anneal = optax.linear_schedule(
-        init_value=1.,
-        end_value=0.,
-        transition_steps=config["REW_SHAPING_HORIZON"]
+        config["NUM_STEPS"] * config["NUM_ENVS"] // config["NUM_MINIBATCHES"]
     )
 
-    def train(rng):
-        """Main training loop"""
-        # Initialize network and optimizer
-        network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
-        rng, _rng = jax.random.split(rng)
-        init_x = jnp.zeros(env.observation_space().shape)
+    # Calculate observation sizes once and store in config
+    obs_shape = env.observation_space().shape
+    print("Original observation shape:", obs_shape)
+    config["ORIG_OBS_SIZE"] = int(np.prod(obs_shape))
+    config["AUG_OBS_SIZE"] = config["ORIG_OBS_SIZE"] + 1
+    print(f"Original obs size: {config['ORIG_OBS_SIZE']}, Augmented obs size: {config['AUG_OBS_SIZE']}")
+
+    # Create network with augmented size
+    network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+
+
+    # def create_network(rng):
+    #     # Calculate observation sizes
+    #     obs_shape = env.observation_space().shape
+    #     print("Original observation shape:", obs_shape)
         
-        init_x = init_x.flatten()
+    #     # Calculate flattened observation size
+    #     orig_obs_size = np.prod(obs_shape)  # Multiply all dimensions
+    #     aug_obs_size = orig_obs_size + 1  # Add 1 for intended action
+        
+    #     print(f"Original obs size: {orig_obs_size}, Augmented obs size: {aug_obs_size}")
+        
+    #     # Initialize with correct augmented size
+    #     init_x = jnp.zeros((aug_obs_size,))
+    #     print("init_x shape:", init_x.shape)
+        
+    #     network_params = network.init(rng, init_x)
+        
+    #     # Create optimizer
+    #     tx = optax.chain(
+    #         optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+    #         optax.adam(config["LR"], eps=1e-5),
+    #     )
+        
+    #     return TrainState.create(
+    #         apply_fn=network.apply,
+    #         params=network_params,
+    #         tx=tx,
+    #     )
+    
+    def create_network(rng):
+        # Initialize with augmented size
+        init_x = jnp.zeros((config["AUG_OBS_SIZE"],))
         print("init_x shape:", init_x.shape)
         
-        network_params = network.init(_rng, init_x)
-        
+        # Initialize network with augmented observation size
+        network_params = network.init(rng, init_x)
+        print("network input x shape:", init_x.shape)
+
+        def linear_schedule(count):
+            """Learning rate annealing schedule"""
+            frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
+            return config["LR"] * frac
+
         # Setup optimizer with optional learning rate annealing
         if config["ANNEAL_LR"]:
             tx = optax.chain(
@@ -231,17 +281,33 @@ def make_train(config):
                 optax.adam(learning_rate=linear_schedule, eps=1e-5),
             )
         else:
-            tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["LR"], eps=1e-5))
-        train_state = TrainState.create(
+            tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), 
+                optax.adam(config["LR"], eps=1e-5)
+            )
+
+        # Create and return train state
+        return TrainState.create(
             apply_fn=network.apply,
             params=network_params,
             tx=tx,
         )
         
+    
+
+    def train(rng):
+        """Main training loop"""
+        # Initialize network and optimizer
+        rng, _rng = jax.random.split(rng)
+
+        # Create training state with augmented network
+        train_state = create_network(_rng)
+        
         # Initialize environment states
         rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+        obsv, env_state = jax.vmap(env.reset)(
+            jax.random.split(_rng, config["NUM_ENVS"])
+        )
         
         # TRAIN LOOP
         def _update_step(runner_state, unused):
@@ -251,65 +317,67 @@ def make_train(config):
 
                 # Split RNGs
                 rng, _rng = jax.random.split(rng)
-                rng, key_a0, key_a1, key_step = jax.random.split(_rng, 4)
+                rng, key_step = jax.random.split(_rng)
 
                 # Debug prints for observation shapes
                 print("Initial observation shapes:")
                 print(f"agent_0 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_0'])}")
                 print(f"agent_1 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_1'])}")
-
-                # 1. Get original batched observations
-                obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
-
-                print("obs_batch shape:", obs_batch.shape)
                 
+                # 1. Get original observations and batch with dummy augmentation
+                flat_obs = {k: v.flatten() for k, v in last_obs.items()}
+                obs_batch = batchify(flat_obs, env.agents, config["NUM_ACTORS"], config["NUM_ENVS"])
+                print("obs_batch shape:", obs_batch.shape) # Should be (32, 521)
+                
+                # 2. Get intended actions
                 pi, value = network.apply(train_state.params, obs_batch)
                 intended_actions = pi.sample(seed=_rng)
-                print("intended actions shape:", intended_actions.shape)
-                intended_actions_dict = unbatchify(intended_actions, env.agents, config["NUM_ENVS"], env.num_agents)
-                intended_actions_dict = {k: v.flatten() for k, v in intended_actions_dict.items()}
-                print("intended_actions:", intended_actions_dict)
+                intended_actions_dict = unbatchify(
+                    intended_actions, 
+                    env.agents, 
+                    config["NUM_ENVS"], 
+                    env.num_agents,
+                    remove_augmentation=False  # Keep full shape for intended actions
+                )
 
-                # 3. Create augmented observations with co-player's intended actions
-                aug_obs = {
-                    "agent_0": jnp.concatenate([last_obs["agent_0"].flatten(), jnp.array([intended_actions_dict["agent_1"]])]),
-                    "agent_1": jnp.concatenate([last_obs["agent_1"].flatten(), jnp.array([intended_actions_dict["agent_0"]])])
-                }
-                aug_obs_batch = batchify(aug_obs, env.agents, config["NUM_ACTORS"])
+                # 3. Create final augmented observations with actual intended actions
+                aug_obs_batch = batchify(
+                    flat_obs, 
+                    env.agents, 
+                    config["NUM_ACTORS"],
+                    dummy_value=intended_actions_dict  # Pass intended actions for augmentation
+                )
 
-                # 4. Compute final actions using augmented observations
+                # 4. Get final actions
                 pi_aug, value = network.apply(train_state.params, aug_obs_batch)
                 action = pi_aug.sample(seed=_rng)
-                print("final action shape:", action.shape)
                 log_prob = pi_aug.log_prob(action)
+                print("final action shape:", action.shape)
 
-                # 5. Prepare actions for environment step
-                env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
-                env_act = {k: v.flatten() for k, v in env_act.items()}
-                print("env_act:", env_act)
-
+                # 5. Step environment (using non-augmented actions)
+                actions = unbatchify(
+                    action, 
+                    env.agents, 
+                    config["NUM_ENVS"], 
+                    env.num_agents,
+                    remove_augmentation=True  # Remove augmentation for environment step
+                )
+                
                 # 6. Step environment
                 rng_step = jax.random.split(key_step, config["NUM_ENVS"])
                 obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0,0,0))(
-                    rng_step, env_state, env_act
+                    rng_step, env_state, actions
                 )
 
-                print("reward:", reward)
-                print("shaped reward:", info["shaped_reward"])
-
-                # 7. Process rewards and info
-                info["reward"] = reward["agent_0"]
-                current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
-                reward = jax.tree.map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, info["shaped_reward"])
-
-                # 8. Create transition with augmented observations
+                # Create transition
                 transition = Transition(
-                    batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    action,
-                    value,
-                    batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    log_prob,
-                    aug_obs_batch,  # Store augmented observations
+                    done=batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    action=action,
+                    value=value,
+                    reward=batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    log_prob=log_prob,
+                    obs=aug_obs_batch,  # Store augmented observations
+                    intended_actions=intended_actions  # Store intended actions
                 )
 
                 runner_state = (train_state, env_state, obsv, update_step, rng)
