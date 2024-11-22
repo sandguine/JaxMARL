@@ -437,7 +437,7 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "FF"],
+        tags=["IPPO", "FF", "Debug", "Oracle"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f'ippo_ff_overcooked_{layout_name}'

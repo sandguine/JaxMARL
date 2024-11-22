@@ -94,9 +94,9 @@ def get_rollout(train_state, config):
 
     # Calculate proper dimensions
     base_obs_shape = env.observation_space().shape  # (5, 4, 26)
-    base_obs_dim = np.prod(base_obs_shape) // 2    # 260 (half of 520)
-    action_dim = env.action_space().n              # 6 since we're using one-hot encoded actions
-    ego_obs_dim = base_obs_dim + action_dim        # 266 (260 + 6)
+    base_obs_dim = np.prod(base_obs_shape)         # 520 (5 * 4 * 26)
+    action_dim = env.action_space().n              # 6 for Overcooked
+    ego_obs_dim = base_obs_dim + action_dim        # 526 (520 + 6)
 
     # Initialize network
     network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
@@ -149,13 +149,12 @@ def get_rollout(train_state, config):
         pi_1, _ = network.apply(network_params_partner, obs["agent_1"])
 
         actions = {"agent_0": pi_0.sample(seed=key_a0), "agent_1": pi_1.sample(seed=key_a1)}
-        print("actions:", actions)
+        print("actions:", actions.shape)
         # env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
         # env_act = {k: v.flatten() for k, v in env_act.items()}
 
         # Step environment forward
         obs, state, reward, done, info = env.step(key_s, state, actions)
-        print("reward:", reward)
         print("shaped reward:", info["shaped_reward"])
         done = done["__all__"]
         rewards.append(reward['agent_0'])
@@ -174,10 +173,19 @@ def get_rollout(train_state, config):
 
     return state_seq
 
-def batchify(x: dict, agent_list, num_actors):
+def batchify(x: dict, agent_list):
     """Convert dict of agent observations to batched array"""
-    x = jnp.stack([x[a] for a in agent_list])
-    return x.reshape((num_actors, -1))
+    # First flatten each observation
+    x = {k: v.reshape(v.shape[0], -1) for k, v in x.items()}
+
+    # Verify flattened shape
+    expected_dim = x[agent_list[0]].shape[-1]
+    assert all(v.shape[-1] == expected_dim for v in x.values()), f"All agents should have same flattened dim, got {[v.shape[-1] for v in x.values()]}"
+    
+    # Stack along first dimension and reshape
+    stacked = jnp.stack([x[a] for a in agent_list])
+    assert stacked.shape[-1] == expected_dim, f"Expected final dim {expected_dim}, got {stacked.shape[-1]}"
+    return stacked.reshape(-1, expected_dim)
 
 
 def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
@@ -226,9 +234,12 @@ def make_train(config):
 
         # Calculate proper dimensions
         base_obs_shape = env.observation_space().shape  # (5, 4, 26)
-        base_obs_dim = np.prod(base_obs_shape) // 2    # 260 (half of 520)
-        action_dim = env.action_space().n              # 6 since we're using one-hot encoded actions
-        ego_obs_dim = base_obs_dim + action_dim        # 266 (260 + 6)
+        base_obs_dim = np.prod(base_obs_shape)         # 520 (5 * 4 * 26)
+        action_dim = env.action_space().n              # 6 for Overcooked
+        ego_obs_dim = base_obs_dim + action_dim        # 526 (520 + 6)
+
+        # Initialize network and optimizer
+        network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
 
         # Initialize seeds
         rng, _rng = jax.random.split(rng)
@@ -288,7 +299,10 @@ def make_train(config):
                 # Partner step - using original observation
                 print("\nPartner shapes:")
                 print("Original partner obs shape:", last_obs['agent_1'].shape)
-                partner_obs_batch = batchify({'agent_1': last_obs['agent_1']}, ['agent_1'], config["NUM_ACTORS"])
+                # Flatten partner observation
+                partner_obs_flat = last_obs['agent_1'].reshape(config["NUM_ENVS"], -1)
+                print("Flattened partner obs shape:", partner_obs_flat.shape)  # Should be (16, 520)
+                partner_obs_batch = batchify({'agent_1': partner_obs_flat}, ['agent_1'])
                 print("Partner obs batch shape:", partner_obs_batch.shape)
                 partner_pi, partner_value = network.apply(train_state.params['partner'], partner_obs_batch)
                 partner_action = partner_pi.sample(seed=_rng)
@@ -299,16 +313,22 @@ def make_train(config):
                 # Ego step - augmenting observation with partner action
                 print("\nEgo shapes:")
                 print("Original ego obs shape:", last_obs['agent_0'].shape)
+                # Flatten ego observation first
+                ego_obs_flat = last_obs['agent_0'].reshape(config["NUM_ENVS"], -1)
+                print("Flattened ego obs shape:", ego_obs_flat.shape)  # Should be (16, 520)
                 partner_action_onehot = jax.nn.one_hot(partner_action, env.action_space().n)
                 print("Partner action onehot shape:", partner_action_onehot.shape)
+                # Reshape partner action to match batch dimension
+                partner_action_reshaped = partner_action_onehot.reshape(ego_obs_flat.shape[0], -1, 6)
+                print("Reshaped partner action shape:", partner_action_reshaped.shape)  # Should be (16, 2, 6)
                 ego_obs = {
                     'agent_0': jnp.concatenate([
                         last_obs['agent_0'],
-                        partner_action_onehot
+                        partner_action_reshaped
                     ], axis=-1)
                 }
                 print("ego_obs_shape:", ego_obs['agent_0'].shape)
-                ego_obs_batch = batchify(ego_obs, ['agent_0'], config["NUM_ACTORS"])
+                ego_obs_batch = batchify(ego_obs, ['agent_0'])
                 print("ego_obs_batch shape:", ego_obs_batch.shape)
                 ego_pi, ego_value = network.apply(train_state.params['ego'], ego_obs_batch)
                 ego_action = ego_pi.sample(seed=_rng)
