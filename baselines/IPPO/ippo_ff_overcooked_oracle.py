@@ -92,26 +92,45 @@ def get_rollout(train_state, config):
     # env_params = env.default_params
     # env = LogWrapper(env)
 
+    # Calculate proper dimensions
+    base_obs_shape = env.observation_space().shape  # (5, 4, 26)
+    base_obs_dim = np.prod(base_obs_shape) // 2    # 260 (half of 520)
+    action_dim = env.action_space().n              # 6 since we're using one-hot encoded actions
+    ego_obs_dim = base_obs_dim + action_dim        # 266 (260 + 6)
+
     # Initialize network
     network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+    
+    # Initialize seeds
     key = jax.random.PRNGKey(0)
-    key, key_r, key_a = jax.random.split(key, 3)
+    key, key_a, key_r = jax.random.split(key, 3)
+    # Split key_a for partner/ego network init
+    key_a_partner, key_a_ego = jax.random.split(key_a)
+    # key_r for environment reset
+    # key for future episode steps
 
-    # Initialize observation
-    init_x = jnp.zeros(env.observation_space().shape)
-    init_x = init_x.flatten()
+    # Partner network init
+    init_x_partner = jnp.zeros(base_obs_dim)
+    init_x_partner = init_x_partner.flatten()
+    
+    network.init(key_a_partner, init_x_partner)
+    network_params_partner = train_state.params['partner']
 
-    network.init(key_a, init_x)
-    network_params = train_state.params
+    # Ego network init
+    init_x_ego = jnp.zeros(ego_obs_dim)
+    init_x_ego = init_x_ego.flatten()
+
+    network.init(key_a_ego, init_x_ego)
+    network_params_ego = train_state.params['ego']
 
     done = False
 
-    # Reset environment and initialize tracking lists
+    # Reset environment using key_r
     obs, state = env.reset(key_r)
     state_seq = [state]
     rewards = []
     shaped_rewards = []
-    
+
     # Run episode until completion
     while not done:
         key, key_a0, key_a1, key_s = jax.random.split(key, 4)
@@ -126,8 +145,8 @@ def get_rollout(train_state, config):
         print("agent_1 obs shape:", obs["agent_1"].shape)
 
         # Get actions from policy for both agents
-        pi_0, _ = network.apply(network_params, obs["agent_0"])
-        pi_1, _ = network.apply(network_params, obs["agent_1"])
+        pi_0, _ = network.apply(network_params_ego, obs["agent_0"])
+        pi_1, _ = network.apply(network_params_partner, obs["agent_1"])
 
         actions = {"agent_0": pi_0.sample(seed=key_a0), "agent_1": pi_1.sample(seed=key_a1)}
         print("actions:", actions)
@@ -205,18 +224,29 @@ def make_train(config):
         print("Action space:", env.action_space().n)
         print("Observation space shape:", env.observation_space().shape)
 
-        # Use env.observation_space() directly and env.action_space() to get the correct dimensions
-        # base_obs_dim = env.observation_space().shape[0]
-        # action_dim = env.action_space().n
+        # Calculate proper dimensions
+        base_obs_shape = env.observation_space().shape  # (5, 4, 26)
+        base_obs_dim = np.prod(base_obs_shape) // 2    # 260 (half of 520)
+        action_dim = env.action_space().n              # 6 since we're using one-hot encoded actions
+        ego_obs_dim = base_obs_dim + action_dim        # 266 (260 + 6)
 
-        # Initialize network and optimizer
-        network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+        # Initialize seeds
         rng, _rng = jax.random.split(rng)
-        init_x = jnp.zeros(env.observation_space().shape)
-        init_x = init_x.flatten()
-        print("init_x shape:", init_x.shape)
+        _rng_partner, _rng_ego = jax.random.split(_rng)  # Split for two networks
         
-        network_params = network.init(_rng, init_x)
+        # Partner network initialization
+        init_x_partner = jnp.zeros(base_obs_dim)
+        init_x_partner = init_x_partner.flatten()
+        print("init_x_partner shape:", init_x_partner.shape)
+        
+        network_params_partner = network.init(_rng_partner, init_x_partner)
+
+        # Ego network initialization
+        init_x_ego = jnp.zeros(ego_obs_dim)
+        init_x_ego = init_x_ego.flatten()
+        print("init_x_ego shape:", init_x_ego.shape)
+
+        network_params_ego = network.init(_rng_ego, init_x_ego)
         
         # Setup optimizer with optional learning rate annealing
         if config["ANNEAL_LR"]:
@@ -226,9 +256,14 @@ def make_train(config):
             )
         else:
             tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["LR"], eps=1e-5))
+        
+        # Create combined train state structure
         train_state = TrainState.create(
             apply_fn=network.apply,
-            params=network_params,
+            params={
+                'partner': network_params_partner,
+                'ego': network_params_ego
+            },
             tx=tx,
         )
         
@@ -255,7 +290,7 @@ def make_train(config):
                 print("Original partner obs shape:", last_obs['agent_1'].shape)
                 partner_obs_batch = batchify({'agent_1': last_obs['agent_1']}, ['agent_1'], config["NUM_ACTORS"])
                 print("Partner obs batch shape:", partner_obs_batch.shape)
-                partner_pi, partner_value = network.apply(train_state.params, partner_obs_batch)
+                partner_pi, partner_value = network.apply(train_state.params['partner'], partner_obs_batch)
                 partner_action = partner_pi.sample(seed=_rng)
                 print("Partner action shape:", partner_action.shape)
                 partner_log_prob = partner_pi.log_prob(partner_action)
@@ -275,7 +310,7 @@ def make_train(config):
                 print("ego_obs_shape:", ego_obs['agent_0'].shape)
                 ego_obs_batch = batchify(ego_obs, ['agent_0'], config["NUM_ACTORS"])
                 print("ego_obs_batch shape:", ego_obs_batch.shape)
-                ego_pi, ego_value = network.apply(train_state.params, ego_obs_batch)
+                ego_pi, ego_value = network.apply(train_state.params['ego'], ego_obs_batch)
                 ego_action = ego_pi.sample(seed=_rng)
                 print("ego_action_shape:", ego_action.shape)
                 ego_log_prob = ego_pi.log_prob(ego_action)
@@ -466,7 +501,7 @@ def make_train(config):
 
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_ff_overcooked")
+@hydra.main(version_base=None, config_path="config", config_name="ippo_ff_overcooked_oracle")
 def main(config):
     """Main entry point for training"""
     # Process config
@@ -478,7 +513,7 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "FF"],
+        tags=["IPPO", "FF", "Oracle"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f'ippo_ff_overcooked_{layout_name}'
