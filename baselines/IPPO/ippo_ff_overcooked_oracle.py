@@ -367,18 +367,27 @@ def make_train(config):
                     "ego": batchify_ego(obsv["agent_0"], partner_action)
                 }
                 runner_state = (train_state, env_state, new_last_obs, update_step, rng)
-                return runner_state, (transition, info)
+                return runner_state, (transition, info, new_last_obs)
 
-            runner_state, (traj_batch, info) = jax.lax.scan(
+            runner_state, (traj_batch, info, new_last_obs) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
             
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, update_step, rng = runner_state
-            last_obs_batch = new_last_obs
-            _, last_val = network.apply(train_state.params, last_obs_batch)
+            train_state, env_state, _, update_step, rng = runner_state
+            
+            # Get last values for both agents using final_obs
+            _, partner_last_val = network.apply(
+                train_state.params['partner'], 
+                new_last_obs["partner"]
+            )
+            _, ego_last_val = network.apply(
+                train_state.params['ego'], 
+                new_last_obs["ego"]
+            )
 
             def _calculate_gae(traj_batch, last_val):
+                """Calculate GAE for a single agent"""
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
                     done, value, reward = (
@@ -402,7 +411,39 @@ def make_train(config):
                 )
                 return advantages, advantages + traj_batch.value
 
-            advantages, targets = _calculate_gae(traj_batch, last_val)
+            # Create separate trajectory batches for each agent
+            partner_traj = Transition(
+                done=traj_batch.done[1],          # Partner index
+                action=traj_batch.action[1],
+                value=traj_batch.value[1],
+                reward=traj_batch.reward[1],
+                log_prob=traj_batch.log_prob[1],
+                obs=traj_batch.obs["partner"]
+            )
+
+            ego_traj = Transition(
+                done=traj_batch.done[0],          # Ego index
+                action=traj_batch.action[0],
+                value=traj_batch.value[0],
+                reward=traj_batch.reward[0],
+                log_prob=traj_batch.log_prob[0],
+                obs=traj_batch.obs["ego"]
+            )
+
+            # Calculate advantages separately for each agent
+            partner_advantages, partner_targets = _calculate_gae_per_agent(
+                partner_traj, 
+                partner_last_val
+            )
+            
+            ego_advantages, ego_targets = _calculate_gae_per_agent(
+                ego_traj, 
+                ego_last_val
+            )
+
+            # Combine advantages and targets
+            advantages = jnp.array([ego_advantages, partner_advantages])
+            targets = jnp.array([ego_targets, partner_targets])
             
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
