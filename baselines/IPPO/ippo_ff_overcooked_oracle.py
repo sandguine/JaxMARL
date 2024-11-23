@@ -35,7 +35,7 @@ class EnvDimensions:
         self.base_obs_shape = None
         self.base_obs_dim = None
         self.action_dim = None
-        self.ego_obs_dim = None
+        self.agent_0_obs_dim = None
     
     @classmethod
     def from_env(cls, env):
@@ -43,7 +43,7 @@ class EnvDimensions:
         dims.base_obs_shape = env.observation_space().shape
         dims.base_obs_dim = np.prod(dims.base_obs_shape)
         dims.action_dim = env.action_space().n
-        dims.ego_obs_dim = dims.base_obs_dim + dims.action_dim
+        dims.agent_0_obs_dim = dims.base_obs_dim + dims.action_dim
         return dims
 
 # Global dimensions
@@ -121,24 +121,24 @@ def get_rollout(train_state, config):
     # Initialize seeds
     key = jax.random.PRNGKey(0)
     key, key_a, key_r = jax.random.split(key, 3)
-    # Split key_a for partner/ego network init
-    key_a_partner, key_a_ego = jax.random.split(key_a)
+    # Split key_a for agent_1/agent_0 network init
+    key_a_agent_1, key_a_agent_0 = jax.random.split(key_a)
     # key_r for environment reset
     # key for future episode steps
 
-    # Partner network init
-    init_x_partner = jnp.zeros(DIMS.base_obs_dim)
-    init_x_partner = init_x_partner.flatten()
+    # agent_1 network init
+    init_x_agent_1 = jnp.zeros(DIMS.base_obs_dim)
+    init_x_agent_1 = init_x_agent_1.flatten()
     
-    network.init(key_a_partner, init_x_partner)
-    network_params_partner = train_state.params['partner']
+    network.init(key_a_agent_1, init_x_agent_1)
+    network_params_agent_1 = train_state.params['agent_1']
 
-    # Ego network init
-    init_x_ego = jnp.zeros(DIMS.ego_obs_dim)
-    init_x_ego = init_x_ego.flatten()
+    # agent_0 network init
+    init_x_agent_0 = jnp.zeros(DIMS.agent_0_obs_dim)
+    init_x_agent_0 = init_x_agent_0.flatten()
 
-    network.init(key_a_ego, init_x_ego)
-    network_params_ego = train_state.params['ego']
+    network.init(key_a_agent_0, init_x_agent_0)
+    network_params_agent_0 = train_state.params['agent_0']
 
     done = False
 
@@ -162,8 +162,8 @@ def get_rollout(train_state, config):
         print("agent_1 obs shape:", obs["agent_1"].shape)
 
         # Get actions from policy for both agents
-        pi_0, _ = network.apply(network_params_ego, obs["agent_0"])
-        pi_1, _ = network.apply(network_params_partner, obs["agent_1"])
+        pi_0, _ = network.apply(network_params_agent_0, obs["agent_0"])
+        pi_1, _ = network.apply(network_params_agent_1, obs["agent_1"])
 
         actions = {"agent_0": pi_0.sample(seed=key_a0), "agent_1": pi_1.sample(seed=key_a1)}
         print("actions:", actions.shape)
@@ -190,17 +190,19 @@ def get_rollout(train_state, config):
 
     return state_seq
 
-def batchify_partner(obs):
-    """Convert partner observations to batched array"""
-    # Partner uses base observation (520 dims)
-    return obs.reshape(DIMS.base_obs_dim)  # (batch_size, 520)
+def batchify_agent_1(obs):
+    """Convert agent_1 observations to batched array"""
+    batched = obs.reshape(obs.shape[0], -1)
+    assert batched.shape[1] == DIMS.base_obs_dim, f"Expected shape (-1, {DIMS.base_obs_dim}), got {batched.shape}"
+    return batched
 
-def batchify_ego(obs, partner_action):
-    """Convert ego observations to batched array with partner action"""
-    # Ego gets augmented observation (520 + 6 dims)
-    base_obs = obs.reshape(DIMS.base_obs_dim)  # (batch_size, 520)
-    action_oh = jax.nn.one_hot(partner_action, DIMS.action_dim)  # (batch_size, 6)
-    return jnp.concatenate([base_obs, action_oh], axis=-1)  # (batch_size, 526)
+def batchify_agent_0(obs, agent_1_action):
+    """Convert agent_0 observations to batched array with agent_1 action"""
+    batch_size = obs.shape[0]
+    base_obs = obs.reshape(batch_size, -1)
+    assert base_obs.shape[1] == DIMS.base_obs_dim, f"Expected shape ({batch_size}, {DIMS.base_obs_dim}), got {base_obs.shape}"
+    action_oh = jax.nn.one_hot(agent_1_action, DIMS.action_dim)
+    return jnp.concatenate([base_obs, action_oh], axis=-1)
 
 def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     """Convert batched array back to dict of agent observations"""
@@ -209,6 +211,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
 
 def make_train(config):
     """Creates the main training function with the given config"""
+    
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     global DIMS
@@ -222,6 +225,14 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+
+    # Configuration printing
+    print("Initializing training with config:")
+    print(f"NUM_ENVS: {config['NUM_ENVS']}")
+    print(f"NUM_STEPS: {config['NUM_STEPS']}")
+    print(f"NUM_UPDATES: {config['NUM_UPDATES']}")
+    print(f"NUM_MINIBATCHES: {config['NUM_MINIBATCHES']}")
+    print(f"TOTAL_TIMESTEPS: {config['TOTAL_TIMESTEPS']}")
     
     env = LogWrapper(env, replace_info=False)
     
@@ -248,21 +259,21 @@ def make_train(config):
 
         # Initialize seeds
         rng, _rng = jax.random.split(rng)
-        _rng_partner, _rng_ego = jax.random.split(_rng)  # Split for two networks
+        _rng_agent_1, _rng_agent_0 = jax.random.split(_rng)  # Split for two networks
         
-        # Partner network initialization
-        init_x_partner = jnp.zeros(DIMS.base_obs_dim)
-        init_x_partner = init_x_partner.flatten()
-        print("init_x_partner shape:", init_x_partner.shape)
+        # agent_1 network initialization
+        init_x_agent_1 = jnp.zeros(DIMS.base_obs_dim)
+        init_x_agent_1 = init_x_agent_1.flatten()
+        print("init_x_agent_1 shape:", init_x_agent_1.shape)
         
-        network_params_partner = network.init(_rng_partner, init_x_partner)
+        network_params_agent_1 = network.init(_rng_agent_1, init_x_agent_1)
 
-        # Ego network initialization
-        init_x_ego = jnp.zeros(DIMS.ego_obs_dim)
-        init_x_ego = init_x_ego.flatten()
-        print("init_x_ego shape:", init_x_ego.shape)
+        # agent_0 network initialization
+        init_x_agent_0 = jnp.zeros(DIMS.agent_0_obs_dim)
+        init_x_agent_0 = init_x_agent_0.flatten()
+        print("init_x_agent_0 shape:", init_x_agent_0.shape)
 
-        network_params_ego = network.init(_rng_ego, init_x_ego)
+        network_params_agent_0 = network.init(_rng_agent_0, init_x_agent_0)
         
         # Setup optimizer with optional learning rate annealing
         if config["ANNEAL_LR"]:
@@ -277,8 +288,8 @@ def make_train(config):
         train_state = TrainState.create(
             apply_fn=network.apply,
             params={
-                'partner': network_params_partner,
-                'ego': network_params_ego
+                'agent_1': network_params_agent_1,
+                'agent_0': network_params_agent_0
             },
             tx=tx,
         )
@@ -287,6 +298,13 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+
+        # Process initial observations
+        initial_obs = {
+            "agent_1": batchify_agent_1(obsv["agent_1"]),
+            # For initial step, we can use zeros for agent_1 action since it doesn't exist yet
+            "agent_0": batchify_agent_0(obsv["agent_0"], jnp.zeros(config["NUM_ENVS"], dtype=jnp.int32))
+        }
         
         # TRAIN LOOP
         def _update_step(runner_state, unused):
@@ -294,43 +312,45 @@ def make_train(config):
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, update_step, rng = runner_state
 
-                # SELECT ACTION
+                # SELECT ACTION consistently with training initialization
                 rng, _rng = jax.random.split(rng)
+                _rng_agent_1, _rng_agent_0 = jax.random.split(_rng)  # Split for two networks
+    
 
                 print("Initial observation shapes:")
-                print(f"agent_ego obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_0'])}")
-                print(f"agent_partner obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_1'])}")
+                print(f"agent_agent_0 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_0'])}")
+                print(f"agent_agent_1 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_1'])}")
 
-                # Partner step - using original observation
-                print("\nPartner shapes:")
-                print("Original partner obs shape:", last_obs['agent_1'].shape)
-                partner_obs_batch = batchify_partner(last_obs['agent_1'])
-                print("Partner obs batch shape:", partner_obs_batch.shape)
-                partner_pi, partner_value = network.apply(train_state.params['partner'], partner_obs_batch)
-                partner_action = partner_pi.sample(seed=_rng)
-                print("Partner action shape:", partner_action.shape)
-                partner_log_prob = partner_pi.log_prob(partner_action)
-                print("Partner log prob shape:", partner_log_prob.shape)
+                # agent_1 step - using original observation
+                print("\nagent_1 shapes:")
+                print("Original agent_1 obs shape:", last_obs['agent_1'].shape)
+                agent_1_obs_batch = batchify_agent_1(last_obs['agent_1'])
+                print("agent_1 obs batch shape:", agent_1_obs_batch.shape)
+                agent_1_pi, agent_1_value = network.apply(train_state.params['agent_1'], agent_1_obs_batch)
+                agent_1_action = agent_1_pi.sample(seed=_rng_agent_1)
+                print("agent_1 action shape:", agent_1_action.shape)
+                agent_1_log_prob = agent_1_pi.log_prob(agent_1_action)
+                print("agent_1 log prob shape:", agent_1_log_prob.shape)
 
-                # Ego step - augmenting observation with partner action
-                print("\nEgo shapes:")
-                print("Original ego obs shape:", last_obs['agent_0'].shape)
-                ego_obs_batch = batchify_ego(last_obs['agent_0'], partner_action)
-                print("ego_obs_batch shape:", ego_obs_batch.shape)
-                ego_pi, ego_value = network.apply(train_state.params['ego'], ego_obs_batch)
-                ego_action = ego_pi.sample(seed=_rng)
-                print("ego_action_shape:", ego_action.shape)
-                ego_log_prob = ego_pi.log_prob(ego_action)
-                print("ego_log_prob_shape:", ego_log_prob.shape)
+                # agent_0 step - augmenting observation with agent_1 action
+                print("\nagent_0 shapes:")
+                print("Original agent_0 obs shape:", last_obs['agent_0'].shape)
+                agent_0_obs_batch = batchify_agent_0(last_obs['agent_0'], agent_1_action)
+                print("agent_0_obs_batch shape:", agent_0_obs_batch.shape)
+                agent_0_pi, agent_0_value = network.apply(train_state.params['agent_0'], agent_0_obs_batch)
+                agent_0_action = agent_0_pi.sample(seed=_rng_agent_0)
+                print("agent_0_action_shape:", agent_0_action.shape)
+                agent_0_log_prob = agent_0_pi.log_prob(agent_0_action)
+                print("agent_0_log_prob_shape:", agent_0_log_prob.shape)
 
                 # Package actions and log probabilities for environment step
                 log_prob = {
-                    'agent_0': ego_log_prob,
-                    'agent_1': partner_log_prob
+                    'agent_0': agent_0_log_prob,
+                    'agent_1': agent_1_log_prob
                 }
                 env_act = {
-                    "agent_0": ego_action,
-                    "agent_1": partner_action
+                    "agent_0": agent_0_action,
+                    "agent_1": agent_1_action
                 }
                 env_act = {k:v.flatten() for k,v in env_act.items()}
                 
@@ -342,34 +362,37 @@ def make_train(config):
                     rng_step, env_state, env_act
                 )
 
-                print("reward:", reward)
-                print("shaped reward:", info["shaped_reward"])
+                # Process observations
+                processed_obs = {
+                    "agent_0": batchify_agent_0(obsv["agent_0"], agent_1_action),
+                    "agent_1": batchify_agent_1(obsv["agent_1"])
+                }
 
+                # Store original reward for logging
                 info["reward"] = reward["agent_0"]
 
+                # Apply reward shaping
                 current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
-                reward = jax.tree.map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, info["shaped_reward"])
+                reward = jax.tree.map(
+                    lambda x, y: x + y * rew_shaping_anneal(current_timestep),
+                    reward,
+                    info["shaped_reward"]
+                )
+                print("shaped reward:", info["shaped_reward"])
 
                 transition = Transition(
                     done=jnp.array([done["agent_0"], done["agent_1"]]).squeeze(),
-                    action=jnp.array([ego_action, partner_action]),
-                    value=jnp.array([ego_value, partner_value]),
+                    action=jnp.array([agent_0_action, agent_1_action]),
+                    value=jnp.array([agent_0_value, agent_1_value]),
                     reward=jnp.array([reward["agent_0"], reward["agent_1"]]).squeeze(),
-                    log_prob=jnp.array([ego_log_prob, partner_log_prob]),
-                    obs={
-                        "partner": batchify_partner(obsv["agent_1"]),
-                        "ego": batchify_ego(obsv["agent_0"], partner_action)
-                    }
+                    log_prob=jnp.array([agent_0_log_prob, agent_1_log_prob]),
+                    obs=processed_obs
                 )
-                # Update runner state with new observation structure
-                new_last_obs = {
-                    "partner": batchify_partner(obsv["agent_1"]),
-                    "ego": batchify_ego(obsv["agent_0"], partner_action)
-                }
-                runner_state = (train_state, env_state, new_last_obs, update_step, rng)
-                return runner_state, (transition, info, new_last_obs)
 
-            runner_state, (traj_batch, info, new_last_obs) = jax.lax.scan(
+                runner_state = (train_state, env_state, processed_obs, update_step, rng)
+                return runner_state, (transition, info, processed_obs)
+
+            runner_state, (traj_batch, info, processed_obs) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
             
@@ -377,16 +400,16 @@ def make_train(config):
             train_state, env_state, _, update_step, rng = runner_state
             
             # Get last values for both agents using final_obs
-            _, partner_last_val = network.apply(
-                train_state.params['partner'], 
-                new_last_obs["partner"]
+            _, agent_1_last_val = network.apply(
+                train_state.params['agent_1'], 
+                processed_obs["agent_1"]
             )
-            _, ego_last_val = network.apply(
-                train_state.params['ego'], 
-                new_last_obs["ego"]
+            _, agent_0_last_val = network.apply(
+                train_state.params['agent_0'], 
+                processed_obs["agent_0"]
             )
 
-            def _calculate_gae(traj_batch, last_val):
+            def _calculate_gae_per_agent(traj_batch, last_val):
                 """Calculate GAE for a single agent"""
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
@@ -412,38 +435,38 @@ def make_train(config):
                 return advantages, advantages + traj_batch.value
 
             # Create separate trajectory batches for each agent
-            partner_traj = Transition(
-                done=traj_batch.done[1],          # Partner index
+            agent_1_traj = Transition(
+                done=traj_batch.done[1],          # agent_1 index
                 action=traj_batch.action[1],
                 value=traj_batch.value[1],
                 reward=traj_batch.reward[1],
                 log_prob=traj_batch.log_prob[1],
-                obs=traj_batch.obs["partner"]
+                obs=traj_batch.obs["agent_1"]
             )
 
-            ego_traj = Transition(
-                done=traj_batch.done[0],          # Ego index
+            agent_0_traj = Transition(
+                done=traj_batch.done[0],          # agent_0 index
                 action=traj_batch.action[0],
                 value=traj_batch.value[0],
                 reward=traj_batch.reward[0],
                 log_prob=traj_batch.log_prob[0],
-                obs=traj_batch.obs["ego"]
+                obs=traj_batch.obs["agent_0"]
             )
 
             # Calculate advantages separately for each agent
-            partner_advantages, partner_targets = _calculate_gae_per_agent(
-                partner_traj, 
-                partner_last_val
+            agent_1_advantages, agent_1_targets = _calculate_gae_per_agent(
+                agent_1_traj, 
+                agent_1_last_val
             )
             
-            ego_advantages, ego_targets = _calculate_gae_per_agent(
-                ego_traj, 
-                ego_last_val
+            agent_0_advantages, agent_0_targets = _calculate_gae_per_agent(
+                agent_0_traj, 
+                agent_0_last_val
             )
 
             # Combine advantages and targets
-            advantages = jnp.array([ego_advantages, partner_advantages])
-            targets = jnp.array([ego_targets, partner_targets])
+            advantages = jnp.array([agent_0_advantages, agent_1_advantages])
+            targets = jnp.array([agent_0_targets, agent_1_targets])
             
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
@@ -547,7 +570,7 @@ def make_train(config):
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, 0, _rng)
+        runner_state = (train_state, env_state, initial_obs, 0, _rng)
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
