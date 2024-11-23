@@ -196,13 +196,17 @@ def batchify_agent_1(obs):
     assert batched.shape[1] == DIMS.base_obs_dim, f"Expected shape (-1, {DIMS.base_obs_dim}), got {batched.shape}"
     return batched
 
-def batchify_agent_0(obs, agent_1_action):
+def batchify_agent_0(obs, agent_1_action, is_first_step=False):
     """Convert agent_0 observations to batched array with agent_1 action"""
     batch_size = obs.shape[0]
-    base_obs = obs.reshape(batch_size, -1)
-    assert base_obs.shape[1] == DIMS.base_obs_dim, f"Expected shape ({batch_size}, {DIMS.base_obs_dim}), got {base_obs.shape}"
+    agent_0_obs = obs.reshape(batch_size, -1)
+    
+    # Replace last action_dim elements with one-hot action
     action_oh = jax.nn.one_hot(agent_1_action, DIMS.action_dim)
-    return jnp.concatenate([base_obs, action_oh], axis=-1)
+    # The observation should already include space for the action at the end
+    concatenated = agent_0_obs.at[:, -DIMS.action_dim:].set(action_oh)
+    assert concatenated.shape[1] == DIMS.agent_0_obs_dim, f"Expected shape (-1, {DIMS.agent_0_obs_dim}), got {concatenated.shape}"
+    return concatenated
 
 def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     """Convert batched array back to dict of agent observations"""
@@ -302,8 +306,10 @@ def make_train(config):
         # Process initial observations
         initial_obs = {
             "agent_1": batchify_agent_1(obsv["agent_1"]),
-            # For initial step, we can use zeros for agent_1 action since it doesn't exist yet
-            "agent_0": batchify_agent_0(obsv["agent_0"], jnp.zeros(config["NUM_ENVS"], dtype=jnp.int32))
+            "agent_0": batchify_agent_0(
+                obsv["agent_0"], 
+                jnp.zeros(config["NUM_ENVS"], dtype=jnp.int32)
+            )
         }
         
         # TRAIN LOOP
