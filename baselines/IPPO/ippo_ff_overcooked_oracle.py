@@ -190,23 +190,9 @@ def get_rollout(train_state, config):
 
     return state_seq
 
-def batchify_agent_1(obs):
-    """Convert agent_1 observations to batched array"""
-    batched = obs.reshape(obs.shape[0], -1)
-    assert batched.shape[1] == DIMS.base_obs_dim, f"Expected shape (-1, {DIMS.base_obs_dim}), got {batched.shape}"
-    return batched
-
-def batchify_agent_0(obs, agent_1_action, is_first_step=False):
-    """Convert agent_0 observations to batched array with agent_1 action"""
-    batch_size = obs.shape[0]
-    agent_0_obs = obs.reshape(batch_size, -1)
-    
-    # Replace last action_dim elements with one-hot action
-    action_oh = jax.nn.one_hot(agent_1_action, DIMS.action_dim)
-    # The observation should already include space for the action at the end
-    concatenated = agent_0_obs.at[:, -DIMS.action_dim:].set(action_oh)
-    assert concatenated.shape[1] == DIMS.agent_0_obs_dim, f"Expected shape (-1, {DIMS.agent_0_obs_dim}), got {concatenated.shape}"
-    return concatenated
+def batchify(x: dict, agent_list, num_actors):
+    x = jnp.stack([x[a] for a in agent_list])
+    return x.reshape((num_actors, -1))
 
 def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     """Convert batched array back to dict of agent observations"""
@@ -302,15 +288,6 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
-
-        # Process initial observations
-        initial_obs = {
-            "agent_1": batchify_agent_1(obsv["agent_1"]),
-            "agent_0": batchify_agent_0(
-                obsv["agent_0"], 
-                jnp.zeros(config["NUM_ENVS"], dtype=jnp.int32)
-            )
-        }
         
         # TRAIN LOOP
         def _update_step(runner_state, unused):
@@ -321,18 +298,18 @@ def make_train(config):
                 # SELECT ACTION consistently with training initialization
                 rng, _rng = jax.random.split(rng)
                 _rng_agent_1, _rng_agent_0 = jax.random.split(_rng)  # Split for two networks
-    
-
-                print("Initial observation shapes:")
-                print(f"agent_agent_0 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_0'])}")
-                print(f"agent_agent_1 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_1'])}")
 
                 # agent_1 step - using original observation
                 print("\nagent_1 shapes:")
                 print("Original agent_1 obs shape:", last_obs['agent_1'].shape)
-                agent_1_obs_batch = batchify_agent_1(last_obs['agent_1'])
+                agent_1_obs_batch = last_obs['agent_1']
+                # Flatten all dimensions except batch dimension
+                agent_1_obs_batch = agent_1_obs_batch.reshape(agent_1_obs_batch.shape[0], -1)  # Shape: (16, 520)
                 print("agent_1 obs batch shape:", agent_1_obs_batch.shape)
-                agent_1_pi, agent_1_value = network.apply(train_state.params['agent_1'], agent_1_obs_batch)
+                agent_1_obs_for_network = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)  # (16, 520)
+                print("agent_1_obs_for_network shape:", agent_1_obs_for_network.shape)
+                agent_1_pi, agent_1_value = network.apply(train_state.params['agent_1'], agent_1_obs_for_network)
+                print("agent_1_value shape:", agent_1_value.shape)
                 agent_1_action = agent_1_pi.sample(seed=_rng_agent_1)
                 print("agent_1 action shape:", agent_1_action.shape)
                 agent_1_log_prob = agent_1_pi.log_prob(agent_1_action)
@@ -341,9 +318,15 @@ def make_train(config):
                 # agent_0 step - augmenting observation with agent_1 action
                 print("\nagent_0 shapes:")
                 print("Original agent_0 obs shape:", last_obs['agent_0'].shape)
-                agent_0_obs_batch = batchify_agent_0(last_obs['agent_0'], agent_1_action)
-                print("agent_0_obs_batch shape:", agent_0_obs_batch.shape)
-                agent_0_pi, agent_0_value = network.apply(train_state.params['agent_0'], agent_0_obs_batch)
+                one_hot_action = jax.nn.one_hot(agent_1_action, DIMS.action_dim)
+                # Flatten observation while preserving batch dimension
+                agent_0_obs_batch = last_obs['agent_0']
+                agent_0_obs_batch = agent_0_obs_batch.reshape(agent_0_obs_batch.shape[0], -1)  # Shape: (16, 520)
+                # Concatenate the one-hot action to the flattened observation
+                agent_0_obs_for_network = jnp.concatenate([agent_0_obs_batch, one_hot_action], axis=1)  # Shape: (16, 526)
+                print("agent_0_obs_for_network shape:", agent_0_obs_for_network.shape)
+                agent_0_pi, agent_0_value = network.apply(train_state.params['agent_0'], agent_0_obs_for_network)
+                print("agent_0_value shape:", agent_0_value.shape)
                 agent_0_action = agent_0_pi.sample(seed=_rng_agent_0)
                 print("agent_0_action_shape:", agent_0_action.shape)
                 agent_0_log_prob = agent_0_pi.log_prob(agent_0_action)
@@ -367,11 +350,12 @@ def make_train(config):
                 obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0,0,0))(
                     rng_step, env_state, env_act
                 )
+                print("next_obs structure:", jax.tree_map(lambda x: x.shape, obsv))
 
-                # Process observations
+                # Processed observations
                 processed_obs = {
-                    "agent_0": batchify_agent_0(obsv["agent_0"], agent_1_action),
-                    "agent_1": batchify_agent_1(obsv["agent_1"])
+                    "agent_0": agent_0_obs_batch,
+                    "agent_1": agent_1_obs_batch
                 }
 
                 # Store original reward for logging
@@ -392,10 +376,13 @@ def make_train(config):
                     value=jnp.array([agent_0_value, agent_1_value]),
                     reward=jnp.array([reward["agent_0"], reward["agent_1"]]).squeeze(),
                     log_prob=jnp.array([agent_0_log_prob, agent_1_log_prob]),
-                    obs=processed_obs
+                    obs={
+                        "agent_0": processed_obs["agent_0"][None, ...],  # shape: (16, 526)
+                        "agent_1": processed_obs["agent_1"][None, ...]   # shape: (16, 520)
+                    }
                 )
 
-                runner_state = (train_state, env_state, processed_obs, update_step, rng)
+                runner_state = (train_state, env_state, obsv, update_step, rng)
                 return runner_state, (transition, info, processed_obs)
 
             runner_state, (traj_batch, info, processed_obs) = jax.lax.scan(
@@ -576,7 +563,7 @@ def make_train(config):
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, initial_obs, 0, _rng)
+        runner_state = (train_state, env_state, obsv, 0, _rng)
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
