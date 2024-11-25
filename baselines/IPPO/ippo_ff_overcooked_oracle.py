@@ -361,27 +361,26 @@ def make_train(config):
             )
             
             # CALCULATE ADVANTAGE
-            train_state, env_state, _, update_step, rng = runner_state
+            train_state, env_state, last_obs, update_step, rng = runner_state
             
             # Calculate last values for both agents
-            _, agent_1_last_val = network.apply(
-                train_state.params['agent_1'], 
-                processed_obs['agent_1']
-            )
+            print("\nCalculating last values:")
+            last_obs_agent1 = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
+            _, agent_1_last_val = network.apply(train_state.params['agent_1'], last_obs_agent1)
+            print("agent_1_last_val shape:", agent_1_last_val.shape)
+
             # For agent_0, need to include agent_1's last action in observation
-            _, agent_0_last_val = network.apply(
-                train_state.params['agent_0'], 
-                processed_obs['agent_0']
-            )
+            one_hot_last_action = jax.nn.one_hot(traj_batch.action[-1, 1], env.action_space().n)
+            last_obs_agent0 = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
+            last_obs_agent0_augmented = jnp.concatenate([last_obs_agent0, one_hot_last_action], axis=-1)
+            _, agent_0_last_val = network.apply(train_state.params['agent_0'], last_obs_agent0_augmented)
+            print("agent_0_last_val shape:", agent_0_last_val.shape)
 
             # Combine values for advantage calculation
-            last_val = {
-                'agent_1': agent_1_last_val,
-                'agent_0': agent_0_last_val
-            }
+            last_val = jnp.array([agent_1_last_val, agent_0_last_val])
+            print("stacked last_val shape:", last_val.shape)
 
-
-            def _calculate_gae_per_agent(traj_batch, last_val, agent_id):
+            def _calculate_gae(traj_batch, last_val):
                 """Calculate GAE per agent"""
                 print(f"\nGAE Calculation Debug:")
                 print(f"last_val shape: {last_val.shape}")
@@ -391,9 +390,9 @@ def make_train(config):
                     gae, next_value = gae_and_next_value
                     
                     done, value, reward = (
-                        transition.done[agent_id],
-                        transition.value[agent_id],
-                        transition.reward[agent_id],
+                        transition.done,
+                        transition.value,
+                        transition.reward,
                     )
 
                     # Debug intermediate calculations
@@ -418,7 +417,7 @@ def make_train(config):
                 _, advantages = jax.lax.scan(
                     _get_advantages,
                     (init_gae, init_value),
-                    traj_batch,
+                    traj_batchj,
                     reverse=True,
                     unroll=16
                 )
@@ -429,29 +428,8 @@ def make_train(config):
                 print(f"returns shape: {(advantages + traj_batch.value[agent_id]).shape}")
                 return advantages, advantages + traj_batch.value[agent_id]
 
-
-            # Calculate advantages separately for each agent
-            agent_1_advantages, agent_1_targets = _calculate_gae_per_agent(
-                traj_batch['agent_1'], 
-                last_val['agent_1'],
-                'agent_1'
-            )
-            
-            agent_0_advantages, agent_0_targets = _calculate_gae_per_agent(
-                traj_batch['agent_0'], 
-                last_val['agent_0'],
-                'agent_0'
-            )
-
-            # Package advantages and targets for both agents
-            advantages = {
-                'agent_1': agent_1_advantages,
-                'agent_0': agent_0_advantages
-            }
-            targets = {
-                'agent_1': agent_1_targets,
-                'agent_0': agent_0_targets
-            }
+            # Calculate advantages 
+            advantages, targets = _calculate_gae(traj_batch, last_val)
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
