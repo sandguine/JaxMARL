@@ -28,26 +28,6 @@ import wandb
 
 import matplotlib.pyplot as plt
 
-# Global dimensions
-class EnvDimensions:
-    """Container for environment dimensions"""
-    def __init__(self):
-        self.base_obs_shape = None
-        self.base_obs_dim = None
-        self.action_dim = None
-        self.agent_0_obs_dim = None
-    
-    @classmethod
-    def from_env(cls, env):
-        dims = cls()
-        dims.base_obs_shape = env.observation_space().shape
-        dims.base_obs_dim = np.prod(dims.base_obs_shape)
-        dims.action_dim = env.action_space().n
-        dims.agent_0_obs_dim = dims.base_obs_dim + dims.action_dim
-        return dims
-
-# Global dimensions
-DIMS = EnvDimensions()
 
 class ActorCritic(nn.Module):
     """Neural network architecture implementing both policy (actor) and value function (critic)"""
@@ -65,6 +45,16 @@ class ActorCritic(nn.Module):
             activation = nn.tanh
 
         # Actor network - outputs action probabilities
+        print("ActorCritic input shape:", x.shape)
+
+        # Check input dimensions
+        if len(x.shape) == 1:
+            expected_dim = x.shape[0]
+        else:
+            expected_dim = x.shape[-1]
+        print(f"Expected input dim: {expected_dim}")  # Debug print
+
+
         actor_mean = nn.Dense(
             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
@@ -112,8 +102,6 @@ def get_rollout(train_state, config):
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     # env_params = env.default_params
     # env = LogWrapper(env)
-    global DIMS
-    DIMS = EnvDimensions.from_env(env)
 
     # Initialize network
     network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
@@ -126,19 +114,19 @@ def get_rollout(train_state, config):
     # key_r for environment reset
     # key for future episode steps
 
-    # agent_1 network init
-    init_x_agent_1 = jnp.zeros(DIMS.base_obs_dim)
-    init_x_agent_1 = init_x_agent_1.flatten()
+    # Get observation shapes
+    base_obs_shape = env.observation_space().shape
+    print("base_obs_shape:", base_obs_shape)
+    print("action_space:", env.action_space().n)
+    ego_obs_shape = (*base_obs_shape[:-1], base_obs_shape[-1] + env.action_space().n)
+    print("ego_obs_shape:", ego_obs_shape)
     
-    network.init(key_a_agent_1, init_x_agent_1)
-    network_params_agent_1 = train_state.params['agent_1']
-
-    # agent_0 network init
-    init_x_agent_0 = jnp.zeros(DIMS.agent_0_obs_dim)
-    init_x_agent_0 = init_x_agent_0.flatten()
-
-    network.init(key_a_agent_0, init_x_agent_0)
-    network_params_agent_0 = train_state.params['agent_0']
+    # Initialize networks with appropriate shapes
+    init_x_agent_1 = jnp.zeros(base_obs_shape).flatten()
+    init_x_agent_0 = jnp.zeros(ego_obs_shape).flatten()
+    
+    network_params_agent_1 = network.init(key_a_agent_1, init_x_agent_1)
+    network_params_agent_0 = network.init(key_a_agent_0, init_x_agent_0)
 
     done = False
 
@@ -204,8 +192,6 @@ def make_train(config):
     
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
-    global DIMS
-    DIMS = EnvDimensions.from_env(env)
 
     # Calculate key training parameters
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
@@ -251,18 +237,16 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         _rng_agent_1, _rng_agent_0 = jax.random.split(_rng)  # Split for two networks
         
-        # agent_1 network initialization
-        init_x_agent_1 = jnp.zeros(DIMS.base_obs_dim)
-        init_x_agent_1 = init_x_agent_1.flatten()
-        print("init_x_agent_1 shape:", init_x_agent_1.shape)
+        # Get observation shapes
+        base_obs_shape = env.observation_space().shape
+        base_obs_dim = np.prod(base_obs_shape)
+        ego_obs_shape = base_obs_dim + env.action_space().n
+        
+        # Initialize networks with appropriate shapes
+        init_x_agent_1 = jnp.zeros(base_obs_shape).flatten()
+        init_x_agent_0 = jnp.zeros(ego_obs_shape).flatten()
         
         network_params_agent_1 = network.init(_rng_agent_1, init_x_agent_1)
-
-        # agent_0 network initialization
-        init_x_agent_0 = jnp.zeros(DIMS.agent_0_obs_dim)
-        init_x_agent_0 = init_x_agent_0.flatten()
-        print("init_x_agent_0 shape:", init_x_agent_0.shape)
-
         network_params_agent_0 = network.init(_rng_agent_0, init_x_agent_0)
         
         # Setup optimizer with optional learning rate annealing
@@ -300,15 +284,11 @@ def make_train(config):
                 _rng_agent_1, _rng_agent_0 = jax.random.split(_rng)  # Split for two networks
 
                 # agent_1 step - using original observation
-                print("\nagent_1 shapes:")
+                print("\nAgent_1 shapes:")
                 print("Original agent_1 obs shape:", last_obs['agent_1'].shape)
-                agent_1_obs_batch = last_obs['agent_1']
-                # Flatten all dimensions except batch dimension
-                agent_1_obs_batch = agent_1_obs_batch.reshape(agent_1_obs_batch.shape[0], -1)  # Shape: (16, 520)
-                print("agent_1 obs batch shape:", agent_1_obs_batch.shape)
-                agent_1_obs_for_network = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)  # (16, 520)
-                print("agent_1_obs_for_network shape:", agent_1_obs_for_network.shape)
-                agent_1_pi, agent_1_value = network.apply(train_state.params['agent_1'], agent_1_obs_for_network)
+                agent_1_obs = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
+                print("agent_1 obs shape:", agent_1_obs.shape)
+                agent_1_pi, agent_1_value = network.apply(train_state.params['agent_1'], agent_1_obs)
                 print("agent_1_value shape:", agent_1_value.shape)
                 agent_1_action = agent_1_pi.sample(seed=_rng_agent_1)
                 print("agent_1 action shape:", agent_1_action.shape)
@@ -316,16 +296,18 @@ def make_train(config):
                 print("agent_1 log prob shape:", agent_1_log_prob.shape)
 
                 # agent_0 step - augmenting observation with agent_1 action
-                print("\nagent_0 shapes:")
+                print("\nAgent_0 shapes:")
                 print("Original agent_0 obs shape:", last_obs['agent_0'].shape)
-                one_hot_action = jax.nn.one_hot(agent_1_action, DIMS.action_dim)
+                one_hot_action = jax.nn.one_hot(agent_1_action, env.action_space().n)
                 # Flatten observation while preserving batch dimension
-                agent_0_obs_batch = last_obs['agent_0']
-                agent_0_obs_batch = agent_0_obs_batch.reshape(agent_0_obs_batch.shape[0], -1)  # Shape: (16, 520)
-                # Concatenate the one-hot action to the flattened observation
-                agent_0_obs_for_network = jnp.concatenate([agent_0_obs_batch, one_hot_action], axis=1)  # Shape: (16, 526)
-                print("agent_0_obs_for_network shape:", agent_0_obs_for_network.shape)
-                agent_0_pi, agent_0_value = network.apply(train_state.params['agent_0'], agent_0_obs_for_network)
+                agent_0_obs = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
+                print("agent_0 obs shape:", agent_0_obs.shape)
+                agent_0_obs_augmented = jnp.concatenate([
+                    agent_0_obs,
+                    one_hot_action
+                ], axis=-1)
+                print("agent_0_obs_augmented shape:", agent_0_obs_augmented.shape)
+                agent_0_pi, agent_0_value = network.apply(train_state.params['agent_0'], agent_0_obs_augmented)
                 print("agent_0_value shape:", agent_0_value.shape)
                 agent_0_action = agent_0_pi.sample(seed=_rng_agent_0)
                 print("agent_0_action_shape:", agent_0_action.shape)
@@ -354,8 +336,8 @@ def make_train(config):
 
                 # Processed observations
                 processed_obs = {
-                    "agent_0": agent_0_obs_batch,
-                    "agent_1": agent_1_obs_batch
+                    "agent_0": agent_0_obs_augmented,
+                    "agent_1": agent_1_obs
                 }
 
                 # Store original reward for logging
