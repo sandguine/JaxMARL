@@ -288,27 +288,42 @@ def make_train(config):
             _, last_val = network.apply(train_state.params, last_obs_batch)
 
             def _calculate_gae(traj_batch, last_val):
+                # Inner function that processes one transition at a time
                 def _get_advantages(gae_and_next_value, transition):
+                    # Unpack the carried state (previous GAE and next state's value)
                     gae, next_value = gae_and_next_value
+                    # Get current transition info
                     done, value, reward = (
                         transition.done,
                         transition.value,
                         transition.reward,
                     )
+
+                    # Calculate TD error (temporal difference)
+                    # δt = rt + γV(st+1) - V(st)
                     delta = reward + config["GAMMA"] * next_value * (1 - done) - value
+
+                    # Calculate GAE using the recursive formula:
+                    # At = δt + (γλ)At+1
+                    # (1 - done) ensures GAE is zero for terminal states
                     gae = (
                         delta
                         + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
                     )
+
+                    # Return the updated GAE and the next state's value
                     return (gae, value), gae
 
+                # Use scan to process the trajectory backwards
                 _, advantages = jax.lax.scan(
                     _get_advantages,
-                    (jnp.zeros_like(last_val), last_val),
-                    traj_batch,
-                    reverse=True,
-                    unroll=16,
+                    (jnp.zeros_like(last_val), last_val), # Initial GAE and the final value
+                    traj_batch, # Sequence of transitions
+                    reverse=True, # Process the trajectory backwards
+                    unroll=16, # Unroll optimization
                 )
+                # Return advantages and value targets
+                # Value targets = advantages + value estimates
                 return advantages, advantages + traj_batch.value
 
             advantages, targets = _calculate_gae(traj_batch, last_val)

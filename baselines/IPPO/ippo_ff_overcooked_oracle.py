@@ -316,12 +316,12 @@ def make_train(config):
 
                 # Package actions and log probabilities for environment step
                 log_prob = {
-                    'agent_0': agent_0_log_prob,
-                    'agent_1': agent_1_log_prob
+                    'agent_1': agent_1_log_prob,
+                    'agent_0': agent_0_log_prob
                 }
                 env_act = {
-                    "agent_0": agent_0_action,
-                    "agent_1": agent_1_action
+                    "agent_1": agent_1_action,
+                    "agent_0": agent_0_action
                 }
                 env_act = {k:v.flatten() for k,v in env_act.items()}
                 
@@ -336,8 +336,8 @@ def make_train(config):
 
                 # Processed observations
                 processed_obs = {
-                    "agent_0": agent_0_obs_augmented,
-                    "agent_1": agent_1_obs
+                    "agent_1": agent_1_obs,
+                    "agent_0": agent_0_obs_augmented
                 }
 
                 # Store original reward for logging
@@ -353,14 +353,14 @@ def make_train(config):
                 print("shaped reward:", info["shaped_reward"])
 
                 transition = Transition(
-                    done=jnp.array([done["agent_0"], done["agent_1"]]).squeeze(),
-                    action=jnp.array([agent_0_action, agent_1_action]),
-                    value=jnp.array([agent_0_value, agent_1_value]),
-                    reward=jnp.array([reward["agent_0"], reward["agent_1"]]).squeeze(),
-                    log_prob=jnp.array([agent_0_log_prob, agent_1_log_prob]),
+                    done=jnp.array([done["agent_1"], done["agent_0"]]).squeeze(),
+                    action=jnp.array([agent_1_action, agent_0_action]),
+                    value=jnp.array([agent_1_value, agent_0_value]),
+                    reward=jnp.array([reward["agent_1"], reward["agent_0"]]).squeeze(),
+                    log_prob=jnp.array([agent_1_log_prob, agent_0_log_prob]),
                     obs={
-                        "agent_0": processed_obs["agent_0"][None, ...],  # shape: (16, 526)
-                        "agent_1": processed_obs["agent_1"][None, ...]   # shape: (16, 520)
+                        "agent_1": processed_obs["agent_1"][None, ...],  # shape: (16, 526)
+                        "agent_0": processed_obs["agent_0"][None, ...]   # shape: (16, 520)
                     }
                 )
 
@@ -377,15 +377,21 @@ def make_train(config):
             # Get last values for both agents using final_obs
             _, agent_1_last_val = network.apply(
                 train_state.params['agent_1'], 
-                processed_obs["agent_1"]
+                agent_1_obs
             )
             _, agent_0_last_val = network.apply(
                 train_state.params['agent_0'], 
-                processed_obs["agent_0"]
+                agent_0_obs_augmented
             )
 
+            # Combine values for advantage calculation
+            last_val = jnp.array([agent_0_last_val, agent_1_last_val])
+
             def _calculate_gae_per_agent(traj_batch, last_val):
-                """Calculate GAE for a single agent"""
+                print(f"\nGAE Calculation Debug:")
+                print(f"last_val shape: {last_val.shape}")
+                print(f"traj_batch shapes:", jax.tree_map(lambda x: x.shape, traj_batch))
+
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
                     done, value, reward = (
@@ -393,20 +399,52 @@ def make_train(config):
                         transition.value,
                         transition.reward,
                     )
+
+                    # Debug intermediate calculations
+                    print(f"\nGAE step debug:")
+                    print(f"done shape: {done.shape}, value: {value.shape}, reward: {reward.shape}")
+                    print(f"next_value shape: {next_value.shape}, gae shape: {gae.shape}")
+        
+                     # Calculate delta and GAE per agent
                     delta = reward + config["GAMMA"] * next_value * (1 - done) - value
-                    gae = (
-                        delta
-                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
-                    )
+                    print(f"delta shape: {delta.shape}, value: {delta}")
+
+                    gae = delta + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                    print(f"calculated gae shape: {gae.shape}, value: {gae}")
+                    
                     return (gae, value), gae
 
-                _, advantages = jax.lax.scan(
+                # Split trajectory batch for each agent
+                agent_0_traj = jax.tree_map(lambda x: x[:, :last_val.shape], traj_batch)  # First 16 entries
+                agent_1_traj = jax.tree_map(lambda x: x[:, last_val.shape:], traj_batch)  # Last 16 entries
+                
+                # Split last values for each agent
+                agent_0_last_val = last_val[:last_val.shape]
+                agent_1_last_val = last_val[last_val.shape:]
+
+                # Calculate GAE separately for each agent
+                _, advantages_0 = jax.lax.scan(
                     _get_advantages,
-                    (jnp.zeros_like(last_val), last_val),
-                    traj_batch,
+                    (jnp.zeros_like(agent_0_last_val), agent_0_last_val),
+                    agent_0_traj,
                     reverse=True,
                     unroll=16,
                 )
+                
+                _, advantages_1 = jax.lax.scan(
+                    _get_advantages,
+                    (jnp.zeros_like(agent_1_last_val), agent_1_last_val),
+                    agent_1_traj,
+                    reverse=True,
+                    unroll=16,
+                )
+
+                # Combine advantages and calculate returns
+                advantages = jnp.concatenate([advantages_0, advantages_1], axis=1)
+
+                print(f"\nFinal shapes:")
+                print(f"advantages shape: {advantages.shape}")
+                print(f"returns shape: {returns.shape}")
                 return advantages, advantages + traj_batch.value
 
             # Create separate trajectory batches for each agent
