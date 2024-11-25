@@ -289,6 +289,9 @@ def make_train(config):
 
             def _calculate_gae(traj_batch, last_val):
                 # Inner function that processes one transition at a time
+                print("traj_batch types:", jax.tree_map(lambda x: x.dtype, traj_batch))
+                print("last_val types:", jax.tree_map(lambda x: x.dtype, last_val))
+                
                 def _get_advantages(gae_and_next_value, transition):
                     # Unpack the carried state (previous GAE and next state's value)
                     gae, next_value = gae_and_next_value
@@ -299,9 +302,15 @@ def make_train(config):
                         transition.reward,
                     )
 
+                    # Debug intermediate calculations
+                    print(f"\nGAE step debug:")
+                    print(f"done shape: {done.shape}, value: {value.shape}, reward: {reward.shape}")
+                    print(f"next_value shape: {next_value.shape}, gae shape: {gae.shape}")
+
                     # Calculate TD error (temporal difference)
                     # δt = rt + γV(st+1) - V(st)
                     delta = reward + config["GAMMA"] * next_value * (1 - done) - value
+                    print(f"delta shape: {delta.shape}, value: {delta}")
 
                     # Calculate GAE using the recursive formula:
                     # At = δt + (γλ)At+1
@@ -310,6 +319,7 @@ def make_train(config):
                         delta
                         + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
                     )
+                    print(f"calculated gae shape: {gae.shape}, value: {gae}")
 
                     # Return the updated GAE and the next state's value
                     return (gae, value), gae
@@ -324,6 +334,10 @@ def make_train(config):
                 )
                 # Return advantages and value targets
                 # Value targets = advantages + value estimates
+                # Calculate returns (advantages + value estimates)
+                print(f"\nFinal shapes:")
+                print(f"advantages shape: {advantages.shape}")
+                print(f"returns shape: {(advantages + traj_batch.value).shape}")
                 return advantages, advantages + traj_batch.value
 
             advantages, targets = _calculate_gae(traj_batch, last_val)

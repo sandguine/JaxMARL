@@ -314,11 +314,12 @@ def make_train(config):
                 agent_0_log_prob = agent_0_pi.log_prob(agent_0_action)
                 print("agent_0_log_prob_shape:", agent_0_log_prob.shape)
 
-                # Package actions and log probabilities for environment step
-                log_prob = {
-                    'agent_1': agent_1_log_prob,
-                    'agent_0': agent_0_log_prob
+                processed_obs = {
+                    'agent_1': agent_1_obs,
+                    'agent_0': agent_0_obs_augmented
                 }
+
+                # Package actions for environment step
                 env_act = {
                     "agent_1": agent_1_action,
                     "agent_0": agent_0_action
@@ -334,34 +335,22 @@ def make_train(config):
                 )
                 print("next_obs structure:", jax.tree_map(lambda x: x.shape, obsv))
 
-                # Processed observations
-                processed_obs = {
-                    "agent_1": agent_1_obs,
-                    "agent_0": agent_0_obs_augmented
-                }
-
+                
                 # Store original reward for logging
                 info["reward"] = reward["agent_0"]
 
                 # Apply reward shaping
                 current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
-                reward = jax.tree.map(
-                    lambda x, y: x + y * rew_shaping_anneal(current_timestep),
-                    reward,
-                    info["shaped_reward"]
-                )
+                reward = jax.tree.map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, info["shaped_reward"])
                 print("shaped reward:", info["shaped_reward"])
 
                 transition = Transition(
                     done=jnp.array([done["agent_1"], done["agent_0"]]).squeeze(),
                     action=jnp.array([agent_1_action, agent_0_action]),
                     value=jnp.array([agent_1_value, agent_0_value]),
-                    reward=jnp.array([reward["agent_1"], reward["agent_0"]]).squeeze(),
+                    reward=batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
                     log_prob=jnp.array([agent_1_log_prob, agent_0_log_prob]),
-                    obs={
-                        "agent_1": processed_obs["agent_1"][None, ...],  # shape: (16, 526)
-                        "agent_0": processed_obs["agent_0"][None, ...]   # shape: (16, 520)
-                    }
+                    obs=processed_obs
                 )
 
                 runner_state = (train_state, env_state, obsv, update_step, rng)
@@ -374,30 +363,37 @@ def make_train(config):
             # CALCULATE ADVANTAGE
             train_state, env_state, _, update_step, rng = runner_state
             
-            # Get last values for both agents using final_obs
+            # Calculate last values for both agents
             _, agent_1_last_val = network.apply(
                 train_state.params['agent_1'], 
-                agent_1_obs
+                processed_obs['agent_1']
             )
+            # For agent_0, need to include agent_1's last action in observation
             _, agent_0_last_val = network.apply(
                 train_state.params['agent_0'], 
-                agent_0_obs_augmented
+                processed_obs['agent_0']
             )
 
             # Combine values for advantage calculation
-            last_val = jnp.array([agent_0_last_val, agent_1_last_val])
+            last_val = {
+                'agent_1': agent_1_last_val,
+                'agent_0': agent_0_last_val
+            }
 
-            def _calculate_gae_per_agent(traj_batch, last_val):
+
+            def _calculate_gae_per_agent(traj_batch, last_val, agent_id):
+                """Calculate GAE per agent"""
                 print(f"\nGAE Calculation Debug:")
                 print(f"last_val shape: {last_val.shape}")
                 print(f"traj_batch shapes:", jax.tree_map(lambda x: x.shape, traj_batch))
 
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
+                    
                     done, value, reward = (
-                        transition.done,
-                        transition.value,
-                        transition.reward,
+                        transition.done[agent_id],
+                        transition.value[agent_id],
+                        transition.reward[agent_id],
                     )
 
                     # Debug intermediate calculations
@@ -414,73 +410,49 @@ def make_train(config):
                     
                     return (gae, value), gae
 
-                # Split trajectory batch for each agent
-                agent_0_traj = jax.tree_map(lambda x: x[:, :last_val.shape], traj_batch)  # First 16 entries
-                agent_1_traj = jax.tree_map(lambda x: x[:, last_val.shape:], traj_batch)  # Last 16 entries
-                
-                # Split last values for each agent
-                agent_0_last_val = last_val[:last_val.shape]
-                agent_1_last_val = last_val[last_val.shape:]
+                # Initialize with agent-specific last value
+                init_gae = jnp.zeros_like(last_val[agent_id])
+                init_value = last_val[agent_id]
 
-                # Calculate GAE separately for each agent
-                _, advantages_0 = jax.lax.scan(
+                # Calculate advantages for an agent
+                _, advantages = jax.lax.scan(
                     _get_advantages,
-                    (jnp.zeros_like(agent_0_last_val), agent_0_last_val),
-                    agent_0_traj,
+                    (init_gae, init_value),
+                    traj_batch,
                     reverse=True,
-                    unroll=16,
-                )
-                
-                _, advantages_1 = jax.lax.scan(
-                    _get_advantages,
-                    (jnp.zeros_like(agent_1_last_val), agent_1_last_val),
-                    agent_1_traj,
-                    reverse=True,
-                    unroll=16,
+                    unroll=16
                 )
 
-                # Combine advantages and calculate returns
-                advantages = jnp.concatenate([advantages_0, advantages_1], axis=1)
-
+                # Calculate returns (advantages + value estimates)
                 print(f"\nFinal shapes:")
                 print(f"advantages shape: {advantages.shape}")
-                print(f"returns shape: {returns.shape}")
-                return advantages, advantages + traj_batch.value
+                print(f"returns shape: {(advantages + traj_batch.value[agent_id]).shape}")
+                return advantages, advantages + traj_batch.value[agent_id]
 
-            # Create separate trajectory batches for each agent
-            agent_1_traj = Transition(
-                done=traj_batch.done[1],          # agent_1 index
-                action=traj_batch.action[1],
-                value=traj_batch.value[1],
-                reward=traj_batch.reward[1],
-                log_prob=traj_batch.log_prob[1],
-                obs=traj_batch.obs["agent_1"]
-            )
-
-            agent_0_traj = Transition(
-                done=traj_batch.done[0],          # agent_0 index
-                action=traj_batch.action[0],
-                value=traj_batch.value[0],
-                reward=traj_batch.reward[0],
-                log_prob=traj_batch.log_prob[0],
-                obs=traj_batch.obs["agent_0"]
-            )
 
             # Calculate advantages separately for each agent
             agent_1_advantages, agent_1_targets = _calculate_gae_per_agent(
-                agent_1_traj, 
-                agent_1_last_val
+                traj_batch['agent_1'], 
+                last_val['agent_1'],
+                'agent_1'
             )
             
             agent_0_advantages, agent_0_targets = _calculate_gae_per_agent(
-                agent_0_traj, 
-                agent_0_last_val
+                traj_batch['agent_0'], 
+                last_val['agent_0'],
+                'agent_0'
             )
 
-            # Combine advantages and targets
-            advantages = jnp.array([agent_0_advantages, agent_1_advantages])
-            targets = jnp.array([agent_0_targets, agent_1_targets])
-            
+            # Package advantages and targets for both agents
+            advantages = {
+                'agent_1': agent_1_advantages,
+                'agent_0': agent_0_advantages
+            }
+            targets = {
+                'agent_1': agent_1_targets,
+                'agent_0': agent_0_targets
+            }
+
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
                 def _update_minbatch(train_state, batch_info):
