@@ -305,11 +305,6 @@ def make_train(config):
                         transition.reward,
                     )
 
-                    # Split reward into (2, 16) where:
-                    # - First dimension (2) represents the two agents
-                    # - Second dimension (16) represents the number of environments
-                    reward = reward.reshape(2, -1)  # or more explicitly: reward.reshape(2, 16)
-
                     # Debug intermediate calculations
                     print(f"\nGAE step debug:")
                     print(f"done shape: {done.shape}")

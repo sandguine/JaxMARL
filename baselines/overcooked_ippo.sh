@@ -5,7 +5,7 @@
 #SBATCH --mem=50gb
 #SBATCH --gpus=1
 #SBATCH --time=2-00:00:00
-#SBATCH --qos=default
+#SBATCH --qos=high
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.9
 python baselines/IPPO/ippo_ff_overcooked_debug.py

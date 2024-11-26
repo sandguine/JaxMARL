@@ -110,7 +110,7 @@ def get_rollout(train_state, config):
     key = jax.random.PRNGKey(0)
     key, key_a, key_r = jax.random.split(key, 3)
     # Split key_a for agent_1/agent_0 network init
-    key_a_agent_1, key_a_agent_0 = jax.random.split(key_a)
+    key_a_agent_0, key_a_agent_1 = jax.random.split(key_a)
     # key_r for environment reset
     # key for future episode steps
 
@@ -122,11 +122,11 @@ def get_rollout(train_state, config):
     print("ego_obs_shape:", ego_obs_shape)
     
     # Initialize networks with appropriate shapes
-    init_x_agent_1 = jnp.zeros(base_obs_shape).flatten()
-    init_x_agent_0 = jnp.zeros(ego_obs_shape).flatten()
+    init_x_agent_0 = jnp.zeros(base_obs_shape).flatten()
+    init_x_agent_1 = jnp.zeros(ego_obs_shape).flatten()
     
-    network_params_agent_1 = network.init(key_a_agent_1, init_x_agent_1)
     network_params_agent_0 = network.init(key_a_agent_0, init_x_agent_0)
+    network_params_agent_1 = network.init(key_a_agent_1, init_x_agent_1)
 
     done = False
 
@@ -235,7 +235,7 @@ def make_train(config):
 
         # Initialize seeds
         rng, _rng = jax.random.split(rng)
-        _rng_agent_1, _rng_agent_0 = jax.random.split(_rng)  # Split for two networks
+        _rng_agent_0, _rng_agent_1 = jax.random.split(_rng)  # Split for two networks
         
         # Get observation shapes
         base_obs_shape = env.observation_space().shape
@@ -243,11 +243,11 @@ def make_train(config):
         ego_obs_shape = base_obs_dim + env.action_space().n
         
         # Initialize networks with appropriate shapes
-        init_x_agent_1 = jnp.zeros(base_obs_shape).flatten()
-        init_x_agent_0 = jnp.zeros(ego_obs_shape).flatten()
+        init_x_agent_0 = jnp.zeros(base_obs_shape).flatten()
+        init_x_agent_1 = jnp.zeros(ego_obs_shape).flatten()
         
-        network_params_agent_1 = network.init(_rng_agent_1, init_x_agent_1)
         network_params_agent_0 = network.init(_rng_agent_0, init_x_agent_0)
+        network_params_agent_1 = network.init(_rng_agent_1, init_x_agent_1)
         
         # Setup optimizer with optional learning rate annealing
         if config["ANNEAL_LR"]:
@@ -262,8 +262,8 @@ def make_train(config):
         train_state = TrainState.create(
             apply_fn=network.apply,
             params={
-                'agent_1': network_params_agent_1,
-                'agent_0': network_params_agent_0
+                'agent_0': network_params_agent_0,
+                'agent_1': network_params_agent_1
             },
             tx=tx,
         )
@@ -281,7 +281,7 @@ def make_train(config):
 
                 # SELECT ACTION consistently with training initialization
                 rng, _rng = jax.random.split(rng)
-                _rng_agent_1, _rng_agent_0 = jax.random.split(_rng)  # Split for two networks
+                _rng_agent_0, _rng_agent_1 = jax.random.split(_rng)  # Split for two networks
 
                 # agent_1 step - using original observation
                 print("\nAgent_1 shapes:")
@@ -315,14 +315,14 @@ def make_train(config):
                 print("agent_0_log_prob_shape:", agent_0_log_prob.shape)
 
                 processed_obs = {
-                    'agent_1': agent_1_obs,
-                    'agent_0': agent_0_obs_augmented
+                    'agent_0': agent_0_obs_augmented,
+                    'agent_1': agent_1_obs
                 }
 
                 # Package actions for environment step
                 env_act = {
-                    "agent_1": agent_1_action,
-                    "agent_0": agent_0_action
+                    "agent_0": agent_0_action,
+                    "agent_1": agent_1_action
                 }
                 env_act = {k:v.flatten() for k,v in env_act.items()}
                 
@@ -444,12 +444,20 @@ def make_train(config):
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
                 def _update_minbatch(train_state, batch_info):
+                    print("\nStarting minibatch update...")
                     traj_batch, advantages, targets = batch_info
+                    print("Minibatch shapes:")
+                    print(f"traj_batch: {jax.tree_map(lambda x: x.shape, traj_batch)}")
+                    print(f"advantages: {advantages.shape}")
+                    print(f"targets: {targets.shape}")
 
                     def _loss_fn(params, traj_batch, gae, targets):
                         # RERUN NETWORK
+                        print("\nCalculating losses...")
                         pi, value = network.apply(params, traj_batch.obs)
+                        print(f"Network outputs - pi shape: {pi.batch_shape}, value shape: {value.shape}")
                         log_prob = pi.log_prob(traj_batch.action)
+                        print(f"Log prob shape: {log_prob.shape}")
 
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
@@ -460,10 +468,13 @@ def make_train(config):
                         value_loss = (
                             0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                         )
+                        print(f"Value loss: {value_loss}")
 
                         # CALCULATE ACTOR LOSS
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                        print(f"Importance ratio shape: {ratio.shape}")
                         gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        print(f"Normalized GAE shape: {gae.shape}")
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -476,18 +487,22 @@ def make_train(config):
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
+                        print(f"Actor loss: {loss_actor}, Entropy: {entropy}")
 
                         total_loss = (
                             loss_actor
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
                         )
+                        print(f"Total loss: {total_loss}")
                         return total_loss, (value_loss, loss_actor, entropy)
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(
                         train_state.params, traj_batch, advantages, targets
                     )
+                    print("\nGradient stats:")
+                    print(f"Grad norm: {optax.global_norm(grads)}")
                     train_state = train_state.apply_gradients(grads=grads)
                     return train_state, total_loss
 
@@ -499,6 +514,7 @@ def make_train(config):
                 ), "batch size must be equal to number of steps * number of actors"
                 permutation = jax.random.permutation(_rng, batch_size)
                 batch = (traj_batch, advantages, targets)
+                print("\nBatch processing:")
                 print("batch_size:", batch_size)
                 print("Original batch structure:", jax.tree_map(lambda x: x.shape, batch))
                 batch = jax.tree_map(
@@ -507,15 +523,17 @@ def make_train(config):
                     batch
                 )
                 print("Reshaped batch structure:", jax.tree_map(lambda x: x.shape, batch))
-                shuffled_batch = jax.tree_map(
+                shuffled_batch = jax.tree.map(
                     lambda x: jnp.take(x, permutation, axis=0), batch
                 )
+                print("Shuffled batch structure:", jax.tree_map(lambda x: x.shape, shuffled_batch))
                 minibatches = jax.tree.map(
                     lambda x: jnp.reshape(
                         x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
                     ),
                     shuffled_batch,
                 )
+                print("Minibatches structure:", jax.tree_map(lambda x: x.shape, minibatches))
                 train_state, total_loss = jax.lax.scan(
                     _update_minbatch, train_state, minibatches
                 )
