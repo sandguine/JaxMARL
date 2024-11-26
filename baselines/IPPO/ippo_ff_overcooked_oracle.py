@@ -202,9 +202,8 @@ def batchify(x: dict,
     Args:
         x: A dictionary of agent-specific data.
         agent_list: A list of agents (`agent_0`, `agent_1`, etc.).
-        num_actors: Total number of actors.
+        num_actors: Total number of actors (num_envs * num_agents).
         preprocess: A callable for preprocessing observations (optional).
-        action_dim: Action space size (for one-hot encoding in preprocessing).
     
     Returns:
         Dictionary with batched data for each agent.
@@ -334,25 +333,27 @@ def make_train(config: dict) -> callable:
                 print(f"agent_0 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_0'])}")
                 print(f"agent_1 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_1'])}")
 
-                agent_1_action = last_obs["agent_1_action"]
+                # Apply network for agent_1 (partner) first
+                pi_1, value_1 = network.apply(train_state.params["agent_1"], last_obs["agent_1"])
+                action_1 = pi_1.sample(seed=_rng_agent_1)
+
+                # Update last_obs with agent_1's action
+                last_obs["agent_1_action"] = action_1
+
+                # Prepare observation batch for agent_0 (ego)
                 obs_batch = batchify(
                     last_obs,
-                    agent_list=["agent_0", "agent_1"],
+                    agent_list=["agent_0"],
                     num_actors=config["NUM_ACTORS"],
                     preprocess=lambda agent, obs: preprocess_observation(
-                        agent, obs, agent_1_action=agent_1_action, action_dim=env.action_space().n
+                        agent, obs, agent_1_action=action_1, action_dim=env.action_space().n
                     )
                 )
-
                 print("obs_batch shape:", obs_batch.shape)
-                
-                # Apply networks
-                pi_0, value_0 = network.apply(train_state.params["agent_0"], batched_obs["agent_0"])
-                pi_1, value_1 = network.apply(train_state.params["agent_1"], batched_obs["agent_1"])
 
-                # Sample actions
-                action_0 = pi_0.sample(seed=rng_agent_0)
-                action_1 = pi_1.sample(seed=rng_agent_1)
+                # Apply network for agent_0 (ego)
+                pi_0, value_0 = network.apply(train_state.params["agent_0"], obs_batch["agent_0"])
+                action_0 = pi_0.sample(seed=_rng_agent_0)
 
                 # Package actions for environment step
                 env_act = {

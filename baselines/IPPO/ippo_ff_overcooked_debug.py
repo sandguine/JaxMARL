@@ -100,6 +100,7 @@ def get_rollout(train_state: TrainState,
 
     # Initialize observation
     init_x = jnp.zeros(env.observation_space().shape)
+    print("init_x shape:", init_x.shape)
     init_x = init_x.flatten()
 
     network.init(key_a, init_x)
