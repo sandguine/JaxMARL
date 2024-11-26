@@ -518,22 +518,50 @@ def make_train(config):
                 print("batch_size:", batch_size)
                 print("Original batch structure:", jax.tree_map(lambda x: x.shape, batch))
                 batch = jax.tree_map(
-                    lambda x: (print(f"Reshaping {x.shape} to {(batch_size,) + x.shape[2:]}"), 
-                            x.reshape((batch_size,) + x.shape[2:]))[1],
-                    batch
+                    lambda x: (
+                        print(f"Reshaping array with shape {x.shape} to ({config['NUM_STEPS']}, {config['NUM_ACTORS']}, -1)"),
+                        x.reshape((config["NUM_STEPS"], config["NUM_ACTORS"], -1))
+                    )[1] if isinstance(x, jnp.ndarray) 
+                    else (
+                        print(f"Skipping reshape for non-array type {type(x)}"),
+                        x
+                    )[1]
+                    , batch
                 )
                 print("Reshaped batch structure:", jax.tree_map(lambda x: x.shape, batch))
-                shuffled_batch = jax.tree.map(
-                    lambda x: jnp.take(x, permutation, axis=0), batch
+                
+                # Special handling for observations dictionary
+                if isinstance(traj_batch.obs, dict):
+                    batch[0].obs = {
+                        agent: obs.reshape((config["NUM_STEPS"], -1))
+                        for agent, obs in traj_batch.obs.items()
+                    }
+
+                # Create permutation that keeps agent pairs together
+                permutation = jax.random.permutation(_rng, config["NUM_STEPS"])
+                
+                # Shuffle while keeping agent pairs together
+                shuffled_batch = jax.tree_map(
+                    lambda x: (
+                        jnp.take(x, permutation, axis=0) 
+                        if isinstance(x, jnp.ndarray) 
+                        else x
+                    ),
+                    batch
                 )
                 print("Shuffled batch structure:", jax.tree_map(lambda x: x.shape, shuffled_batch))
-                minibatches = jax.tree.map(
-                    lambda x: jnp.reshape(
-                        x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
+                
+                minibatches = jax.tree_map(
+                    lambda x: (
+                        jnp.reshape(
+                            x, 
+                            [config["NUM_MINIBATCHES"], -1, num_agents, x.shape[-1]]
+                        ) if isinstance(x, jnp.ndarray) else x
                     ),
-                    shuffled_batch,
+                    shuffled_batch
                 )
                 print("Minibatches structure:", jax.tree_map(lambda x: x.shape, minibatches))
+                
                 train_state, total_loss = jax.lax.scan(
                     _update_minbatch, train_state, minibatches
                 )
