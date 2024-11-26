@@ -289,8 +289,11 @@ def make_train(config):
 
             def _calculate_gae(traj_batch, last_val):
                 # Inner function that processes one transition at a time
+                print(f"\nGAE Calculation Debug:")
                 print("traj_batch types:", jax.tree_map(lambda x: x.dtype, traj_batch))
+                print(f"traj_batch shapes:", jax.tree_map(lambda x: x.shape, traj_batch))
                 print("last_val types:", jax.tree_map(lambda x: x.dtype, last_val))
+                print(f"last_val shape: {last_val.shape}")
                 
                 def _get_advantages(gae_and_next_value, transition):
                     # Unpack the carried state (previous GAE and next state's value)
@@ -302,10 +305,18 @@ def make_train(config):
                         transition.reward,
                     )
 
+                    # Split reward into (2, 16) where:
+                    # - First dimension (2) represents the two agents
+                    # - Second dimension (16) represents the number of environments
+                    reward = reward.reshape(2, -1)  # or more explicitly: reward.reshape(2, 16)
+
                     # Debug intermediate calculations
                     print(f"\nGAE step debug:")
-                    print(f"done shape: {done.shape}, value: {value.shape}, reward: {reward.shape}")
-                    print(f"next_value shape: {next_value.shape}, gae shape: {gae.shape}")
+                    print(f"done shape: {done.shape}")
+                    print(f"value shape: {value.shape}")
+                    print(f"reward shape: {reward.shape}")
+                    print(f"next_value shape: {next_value.shape}")
+                    print(f"gae shape: {gae.shape}")
 
                     # Calculate TD error (temporal difference)
                     # δt = rt + γV(st+1) - V(st)
@@ -345,12 +356,20 @@ def make_train(config):
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
                 def _update_minbatch(train_state, batch_info):
+                    print("\nStarting minibatch update...")
                     traj_batch, advantages, targets = batch_info
+                    print("Minibatch shapes:")
+                    print(f"traj_batch: {jax.tree_map(lambda x: x.shape, traj_batch)}")
+                    print(f"advantages: {advantages.shape}")
+                    print(f"targets: {targets.shape}")
 
                     def _loss_fn(params, traj_batch, gae, targets):
+                        print("\nCalculating losses...")
                         # RERUN NETWORK
                         pi, value = network.apply(params, traj_batch.obs)
+                        print(f"Network outputs - pi shape: {pi.batch_shape}, value shape: {value.shape}")
                         log_prob = pi.log_prob(traj_batch.action)
+                        print(f"Log prob shape: {log_prob.shape}")
 
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
@@ -361,10 +380,13 @@ def make_train(config):
                         value_loss = (
                             0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                         )
+                        print(f"Value loss: {value_loss}")
 
                         # CALCULATE ACTOR LOSS
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                        print(f"Importance ratio shape: {ratio.shape}")
                         gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        print(f"Normalized GAE shape: {gae.shape}")
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -377,18 +399,22 @@ def make_train(config):
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
+                        print(f"Actor loss: {loss_actor}, Entropy: {entropy}")
 
                         total_loss = (
                             loss_actor
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
                         )
+                        print(f"Total loss: {total_loss}")
                         return total_loss, (value_loss, loss_actor, entropy)
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(
                         train_state.params, traj_batch, advantages, targets
                     )
+                    print("\nGradient stats:")
+                    print(f"Grad norm: {optax.global_norm(grads)}")
                     train_state = train_state.apply_gradients(grads=grads)
                     return train_state, total_loss
 
@@ -400,18 +426,26 @@ def make_train(config):
                 ), "batch size must be equal to number of steps * number of actors"
                 permutation = jax.random.permutation(_rng, batch_size)
                 batch = (traj_batch, advantages, targets)
-                batch = jax.tree.map(
-                    lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
+                print("\nBatch processing:")
+                print("batch_size:", batch_size)
+                print("Original batch structure:", jax.tree_map(lambda x: x.shape, batch))
+                batch = jax.tree_map(
+                    lambda x: (print(f"Reshaping {x.shape} to {(batch_size,) + x.shape[2:]}"), 
+                            x.reshape((batch_size,) + x.shape[2:]))[1],
+                    batch
                 )
+                print("Reshaped batch structure:", jax.tree_map(lambda x: x.shape, batch))
                 shuffled_batch = jax.tree.map(
                     lambda x: jnp.take(x, permutation, axis=0), batch
                 )
+                print("Shuffled batch structure:", jax.tree_map(lambda x: x.shape, shuffled_batch))
                 minibatches = jax.tree.map(
                     lambda x: jnp.reshape(
                         x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
                     ),
                     shuffled_batch,
                 )
+                print("Minibatches structure:", jax.tree_map(lambda x: x.shape, minibatches))
                 train_state, total_loss = jax.lax.scan(
                     _update_minbatch, train_state, minibatches
                 )

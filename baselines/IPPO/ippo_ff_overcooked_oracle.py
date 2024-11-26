@@ -348,7 +348,10 @@ def make_train(config):
                     done=jnp.array([done["agent_1"], done["agent_0"]]).squeeze(),
                     action=jnp.array([agent_1_action, agent_0_action]),
                     value=jnp.array([agent_1_value, agent_0_value]),
-                    reward=batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    reward=jnp.array([
+                        reward["agent_1"],  # Agent 1's rewards
+                        reward["agent_0"]   # Agent 0's rewards
+                    ]).squeeze(),
                     log_prob=jnp.array([agent_1_log_prob, agent_0_log_prob]),
                     obs=processed_obs
                 )
@@ -383,8 +386,11 @@ def make_train(config):
             def _calculate_gae(traj_batch, last_val):
                 """Calculate GAE per agent"""
                 print(f"\nGAE Calculation Debug:")
-                print(f"last_val shape: {last_val.shape}")
+                print("traj_batch types:", jax.tree_map(lambda x: x.dtype, traj_batch))
                 print(f"traj_batch shapes:", jax.tree_map(lambda x: x.shape, traj_batch))
+                print("last_val types:", jax.tree_map(lambda x: x.dtype, last_val))
+                print(f"last_val shape: {last_val.shape}")
+                
 
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
@@ -397,8 +403,12 @@ def make_train(config):
 
                     # Debug intermediate calculations
                     print(f"\nGAE step debug:")
-                    print(f"done shape: {done.shape}, value: {value.shape}, reward: {reward.shape}")
-                    print(f"next_value shape: {next_value.shape}, gae shape: {gae.shape}")
+                    print(f"done shape: {done.shape}")
+                    print(f"value shape: {value.shape}")
+                    print(f"reward shape: {reward.shape}")
+                    print(f"next_value shape: {next_value.shape}")
+                    print(f"gae shape: {gae.shape}")
+
         
                      # Calculate delta and GAE per agent
                     delta = reward + config["GAMMA"] * next_value * (1 - done) - value
@@ -410,14 +420,14 @@ def make_train(config):
                     return (gae, value), gae
 
                 # Initialize with agent-specific last value
-                init_gae = jnp.zeros_like(last_val[agent_id])
-                init_value = last_val[agent_id]
+                init_gae = jnp.zeros_like(last_val)
+                init_value = last_val
 
                 # Calculate advantages for an agent
                 _, advantages = jax.lax.scan(
                     _get_advantages,
                     (init_gae, init_value),
-                    traj_batchj,
+                    traj_batch,
                     reverse=True,
                     unroll=16
                 )
@@ -425,8 +435,8 @@ def make_train(config):
                 # Calculate returns (advantages + value estimates)
                 print(f"\nFinal shapes:")
                 print(f"advantages shape: {advantages.shape}")
-                print(f"returns shape: {(advantages + traj_batch.value[agent_id]).shape}")
-                return advantages, advantages + traj_batch.value[agent_id]
+                print(f"returns shape: {(advantages + traj_batch.value).shape}")
+                return advantages, advantages + traj_batch.value
 
             # Calculate advantages 
             advantages, targets = _calculate_gae(traj_batch, last_val)
@@ -489,10 +499,15 @@ def make_train(config):
                 ), "batch size must be equal to number of steps * number of actors"
                 permutation = jax.random.permutation(_rng, batch_size)
                 batch = (traj_batch, advantages, targets)
-                batch = jax.tree.map(
-                    lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
+                print("batch_size:", batch_size)
+                print("Original batch structure:", jax.tree_map(lambda x: x.shape, batch))
+                batch = jax.tree_map(
+                    lambda x: (print(f"Reshaping {x.shape} to {(batch_size,) + x.shape[2:]}"), 
+                            x.reshape((batch_size,) + x.shape[2:]))[1],
+                    batch
                 )
-                shuffled_batch = jax.tree.map(
+                print("Reshaped batch structure:", jax.tree_map(lambda x: x.shape, batch))
+                shuffled_batch = jax.tree_map(
                     lambda x: jnp.take(x, permutation, axis=0), batch
                 )
                 minibatches = jax.tree.map(
