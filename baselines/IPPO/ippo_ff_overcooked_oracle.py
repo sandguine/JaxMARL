@@ -28,7 +28,6 @@ import wandb
 
 import matplotlib.pyplot as plt
 
-
 class ActorCritic(nn.Module):
     """Neural network architecture implementing both policy (actor) and value function (critic)"""
     action_dim: Sequence[int]  # Dimension of action space
@@ -45,16 +44,6 @@ class ActorCritic(nn.Module):
             activation = nn.tanh
 
         # Actor network - outputs action probabilities
-        print("ActorCritic input shape:", x.shape)
-
-        # Check input dimensions
-        if len(x.shape) == 1:
-            expected_dim = x.shape[0]
-        else:
-            expected_dim = x.shape[-1]
-        print(f"Expected input dim: {expected_dim}")  # Debug print
-
-
         actor_mean = nn.Dense(
             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(x)
@@ -105,8 +94,6 @@ def get_rollout(train_state, config):
 
     # Initialize network
     network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
-    
-    # Initialize seeds
     key = jax.random.PRNGKey(0)
     key, key_a, key_r = jax.random.split(key, 3)
     # Split key_a for agent_1/agent_0 network init
@@ -130,12 +117,12 @@ def get_rollout(train_state, config):
 
     done = False
 
-    # Reset environment using key_r
+    # Reset environment and initialize tracking lists
     obs, state = env.reset(key_r)
     state_seq = [state]
     rewards = []
     shaped_rewards = []
-
+    
     # Run episode until completion
     while not done:
         key, key_a0, key_a1, key_s = jax.random.split(key, 4)
@@ -150,16 +137,17 @@ def get_rollout(train_state, config):
         print("agent_1 obs shape:", obs["agent_1"].shape)
 
         # Get actions from policy for both agents
-        pi_0, _ = network.apply(network_params_agent_0, obs["agent_0"])
-        pi_1, _ = network.apply(network_params_agent_1, obs["agent_1"])
+        pi_0, _ = network.apply(network_params, obs["agent_0"])
+        pi_1, _ = network.apply(network_params, obs["agent_1"])
 
         actions = {"agent_0": pi_0.sample(seed=key_a0), "agent_1": pi_1.sample(seed=key_a1)}
-        print("actions:", actions.shape)
+        print("actions:", actions)
         # env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
         # env_act = {k: v.flatten() for k, v in env_act.items()}
 
         # Step environment forward
         obs, state, reward, done, info = env.step(key_s, state, actions)
+        print("reward:", reward)
         print("shaped reward:", info["shaped_reward"])
         done = done["__all__"]
         rewards.append(reward['agent_0'])
@@ -178,18 +166,74 @@ def get_rollout(train_state, config):
 
     return state_seq
 
-def batchify(x: dict, agent_list, num_actors):
-    x = jnp.stack([x[a] for a in agent_list])
-    return x.reshape((num_actors, -1))
+def preprocess_observation(agent, obs, agent_1_action=None, action_dim=None):
+    """
+    Preprocesses observations based on the agent type.
+    
+    - `agent_0` includes one-hot encoding of `agent_1`'s action.
+    - `agent_1` remains unchanged.
+    
+    Args:
+        agent: The agent identifier (`agent_0` or `agent_1`).
+        obs: The original observation array.
+        agent_1_action: The action taken by `agent_1`.
+        action_dim: The size of the action space for one-hot encoding.
+    
+    Returns:
+        Processed observation array.
+    """
+    if agent == "agent_0" and agent_1_action is not None:
+        one_hot_action = jax.nn.one_hot(agent_1_action, action_dim)
+        return jnp.concatenate([obs, one_hot_action], axis=-1)
+    return obs
 
-def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
-    """Convert batched array back to dict of agent observations"""
-    x = x.reshape((num_actors, num_envs, -1))
-    return {a: x[i] for i, a in enumerate(agent_list)}
+def batchify(x: dict, agent_list, num_actors, preprocess=None, action_dim=None):
+    """
+    Batchify observations or other data with optional preprocessing.
+    
+    Args:
+        x: A dictionary of agent-specific data.
+        agent_list: A list of agents (`agent_0`, `agent_1`, etc.).
+        num_actors: Total number of actors.
+        preprocess: A callable for preprocessing observations (optional).
+        action_dim: Action space size (for one-hot encoding in preprocessing).
+    
+    Returns:
+        Dictionary with batched data for each agent.
+    """
+    batched_obs = {}
+    for agent in agent_list:
+        data = x[agent]
+        if preprocess:
+            data = preprocess(agent, data, action_dim=action_dim)
+        batched_obs[agent] = data.reshape((num_actors // len(agent_list), -1))
+    return batched_obs
+
+
+def unbatchify(x: jnp.ndarray, agent_list, num_envs, preprocess=None, action_dim=None):
+    """
+    Convert batched arrays back to a dictionary of agent-specific data.
+
+    Args:
+        x: A dictionary of batched agent-specific data.
+        agent_list: A list of agents (`agent_0`, `agent_1`, etc.).
+        num_envs: The number of environments.
+        preprocess: A callable for postprocessing observations (optional).
+        action_dim: Action space size (for one-hot encoding in postprocessing).
+
+    Returns:
+        Dictionary with unbatched data for each agent.
+    """
+    unbatched_obs = {}
+    for agent in agent_list:
+        data = x[agent].reshape((num_envs, -1))  # Unbatch data for this agent
+        if preprocess:
+            data = preprocess(agent, data, action_dim=action_dim)
+        unbatched_obs[agent] = data
+    return unbatched_obs
 
 def make_train(config):
     """Creates the main training function with the given config"""
-    
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
 
@@ -201,14 +245,6 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
-
-    # Configuration printing
-    print("Initializing training with config:")
-    print(f"NUM_ENVS: {config['NUM_ENVS']}")
-    print(f"NUM_STEPS: {config['NUM_STEPS']}")
-    print(f"NUM_UPDATES: {config['NUM_UPDATES']}")
-    print(f"NUM_MINIBATCHES: {config['NUM_MINIBATCHES']}")
-    print(f"TOTAL_TIMESTEPS: {config['TOTAL_TIMESTEPS']}")
     
     env = LogWrapper(env, replace_info=False)
     
@@ -283,46 +319,34 @@ def make_train(config):
                 rng, _rng = jax.random.split(rng)
                 _rng_agent_1, _rng_agent_0 = jax.random.split(_rng)  # Split for two networks
 
-                # agent_1 step - using original observation
-                print("\nAgent_1 shapes:")
-                print("Original agent_1 obs shape:", last_obs['agent_1'].shape)
-                agent_1_obs = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
-                print("agent_1 obs shape:", agent_1_obs.shape)
-                agent_1_pi, agent_1_value = network.apply(train_state.params['agent_1'], agent_1_obs)
-                print("agent_1_value shape:", agent_1_value.shape)
-                agent_1_action = agent_1_pi.sample(seed=_rng_agent_1)
-                print("agent_1 action shape:", agent_1_action.shape)
-                agent_1_log_prob = agent_1_pi.log_prob(agent_1_action)
-                print("agent_1 log prob shape:", agent_1_log_prob.shape)
+                print("Initial observation shapes:")
+                print(f"agent_0 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_0'])}")
+                print(f"agent_1 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_1'])}")
 
-                # agent_0 step - augmenting observation with agent_1 action
-                print("\nAgent_0 shapes:")
-                print("Original agent_0 obs shape:", last_obs['agent_0'].shape)
-                one_hot_action = jax.nn.one_hot(agent_1_action, env.action_space().n)
-                # Flatten observation while preserving batch dimension
-                agent_0_obs = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
-                print("agent_0 obs shape:", agent_0_obs.shape)
-                agent_0_obs_augmented = jnp.concatenate([
-                    agent_0_obs,
-                    one_hot_action
-                ], axis=-1)
-                print("agent_0_obs_augmented shape:", agent_0_obs_augmented.shape)
-                agent_0_pi, agent_0_value = network.apply(train_state.params['agent_0'], agent_0_obs_augmented)
-                print("agent_0_value shape:", agent_0_value.shape)
-                agent_0_action = agent_0_pi.sample(seed=_rng_agent_0)
-                print("agent_0_action_shape:", agent_0_action.shape)
-                agent_0_log_prob = agent_0_pi.log_prob(agent_0_action)
-                print("agent_0_log_prob_shape:", agent_0_log_prob.shape)
+                agent_1_action = last_obs["agent_1_action"]
+                obs_batch = batchify(
+                    last_obs,
+                    agent_list=["agent_0", "agent_1"],
+                    num_actors=config["NUM_ACTORS"],
+                    preprocess=lambda agent, obs: preprocess_observation(
+                        agent, obs, agent_1_action=agent_1_action, action_dim=env.action_space().n
+                    )
+                )
 
-                processed_obs = {
-                    'agent_1': agent_1_obs,
-                    'agent_0': agent_0_obs_augmented
-                }
+                print("obs_batch shape:", obs_batch.shape)
+                
+                # Apply networks
+                pi_0, value_0 = network.apply(train_state.params["agent_0"], batched_obs["agent_0"])
+                pi_1, value_1 = network.apply(train_state.params["agent_1"], batched_obs["agent_1"])
+
+                # Sample actions
+                action_0 = pi_0.sample(seed=rng_agent_0)
+                action_1 = pi_1.sample(seed=rng_agent_1)
 
                 # Package actions for environment step
                 env_act = {
-                    "agent_1": agent_1_action,
-                    "agent_0": agent_0_action
+                    "agent_0": action_0,
+                    "agent_1": action_1,
                 }
                 env_act = {k:v.flatten() for k,v in env_act.items()}
                 
@@ -333,62 +357,44 @@ def make_train(config):
                 obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0,0,0))(
                     rng_step, env_state, env_act
                 )
-                print("next_obs structure:", jax.tree_map(lambda x: x.shape, obsv))
 
-                
-                # Store original reward for logging
-                info["reward"] = reward["agent_0"]
-
-                # Apply reward shaping
-                current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
-                reward = jax.tree.map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, info["shaped_reward"])
+                print("reward:", reward)
                 print("shaped reward:", info["shaped_reward"])
 
+                info["reward"] = reward["agent_0"]
+
+                current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
+                reward = jax.tree.map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, info["shaped_reward"])
+
                 transition = Transition(
-                    done=jnp.array([done["agent_1"], done["agent_0"]]).squeeze(),
-                    action=jnp.array([agent_1_action, agent_0_action]),
-                    value=jnp.array([agent_1_value, agent_0_value]),
-                    reward=batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    log_prob=jnp.array([agent_1_log_prob, agent_0_log_prob]),
-                    obs=processed_obs
+                    batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    action,
+                    value,
+                    batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
+                    log_prob,
+                    obs_batch,
                 )
-
                 runner_state = (train_state, env_state, obsv, update_step, rng)
-                return runner_state, (transition, info, processed_obs)
+                return runner_state, (transition, info)
 
-            runner_state, (traj_batch, info, processed_obs) = jax.lax.scan(
+            runner_state, (traj_batch, info) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
             
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, update_step, rng = runner_state
-            
-            # Calculate last values for both agents
-            print("\nCalculating last values:")
-            last_obs_agent1 = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
-            _, agent_1_last_val = network.apply(train_state.params['agent_1'], last_obs_agent1)
-            print("agent_1_last_val shape:", agent_1_last_val.shape)
-
-            # For agent_0, need to include agent_1's last action in observation
-            one_hot_last_action = jax.nn.one_hot(traj_batch.action[-1, 1], env.action_space().n)
-            last_obs_agent0 = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
-            last_obs_agent0_augmented = jnp.concatenate([last_obs_agent0, one_hot_last_action], axis=-1)
-            _, agent_0_last_val = network.apply(train_state.params['agent_0'], last_obs_agent0_augmented)
-            print("agent_0_last_val shape:", agent_0_last_val.shape)
-
-            # Combine values for advantage calculation
-            last_val = jnp.array([agent_1_last_val, agent_0_last_val])
-            print("stacked last_val shape:", last_val.shape)
+            last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+            _, last_val = network.apply(train_state.params, last_obs_batch)
 
             def _calculate_gae(traj_batch, last_val):
-                """Calculate GAE per agent"""
-                print(f"\nGAE Calculation Debug:")
-                print(f"last_val shape: {last_val.shape}")
-                print(f"traj_batch shapes:", jax.tree_map(lambda x: x.shape, traj_batch))
-
+                # Inner function that processes one transition at a time
+                print("traj_batch types:", jax.tree_map(lambda x: x.dtype, traj_batch))
+                print("last_val types:", jax.tree_map(lambda x: x.dtype, last_val))
+                
                 def _get_advantages(gae_and_next_value, transition):
+                    # Unpack the carried state (previous GAE and next state's value)
                     gae, next_value = gae_and_next_value
-                    
+                    # Get current transition info
                     done, value, reward = (
                         transition.done,
                         transition.value,
@@ -399,38 +405,42 @@ def make_train(config):
                     print(f"\nGAE step debug:")
                     print(f"done shape: {done.shape}, value: {value.shape}, reward: {reward.shape}")
                     print(f"next_value shape: {next_value.shape}, gae shape: {gae.shape}")
-        
-                     # Calculate delta and GAE per agent
+
+                    # Calculate TD error (temporal difference)
+                    # δt = rt + γV(st+1) - V(st)
                     delta = reward + config["GAMMA"] * next_value * (1 - done) - value
                     print(f"delta shape: {delta.shape}, value: {delta}")
 
-                    gae = delta + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                    # Calculate GAE using the recursive formula:
+                    # At = δt + (γλ)At+1
+                    # (1 - done) ensures GAE is zero for terminal states
+                    gae = (
+                        delta
+                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                    )
                     print(f"calculated gae shape: {gae.shape}, value: {gae}")
-                    
+
+                    # Return the updated GAE and the next state's value
                     return (gae, value), gae
 
-                # Initialize with agent-specific last value
-                init_gae = jnp.zeros_like(last_val[agent_id])
-                init_value = last_val[agent_id]
-
-                # Calculate advantages for an agent
+                # Use scan to process the trajectory backwards
                 _, advantages = jax.lax.scan(
                     _get_advantages,
-                    (init_gae, init_value),
-                    traj_batchj,
-                    reverse=True,
-                    unroll=16
+                    (jnp.zeros_like(last_val), last_val), # Initial GAE and the final value
+                    traj_batch, # Sequence of transitions
+                    reverse=True, # Process the trajectory backwards
+                    unroll=16, # Unroll optimization
                 )
-
+                # Return advantages and value targets
+                # Value targets = advantages + value estimates
                 # Calculate returns (advantages + value estimates)
                 print(f"\nFinal shapes:")
                 print(f"advantages shape: {advantages.shape}")
-                print(f"returns shape: {(advantages + traj_batch.value[agent_id]).shape}")
-                return advantages, advantages + traj_batch.value[agent_id]
+                print(f"returns shape: {(advantages + traj_batch.value).shape}")
+                return advantages, advantages + traj_batch.value
 
-            # Calculate advantages 
             advantages, targets = _calculate_gae(traj_batch, last_val)
-
+            
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
                 def _update_minbatch(train_state, batch_info):
@@ -555,7 +565,7 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "FF", "Oracle"],
+        tags=["IPPO", "FF", "Oracle-Modular"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f'ippo_ff_overcooked_{layout_name}'
