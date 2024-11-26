@@ -122,8 +122,8 @@ def get_rollout(train_state, config):
     print("ego_obs_shape:", ego_obs_shape)
     
     # Initialize networks with appropriate shapes
-    init_x_agent_0 = jnp.zeros(base_obs_shape).flatten()
-    init_x_agent_1 = jnp.zeros(ego_obs_shape).flatten()
+    init_x_agent_0 = jnp.zeros(ego_obs_shape).flatten()
+    init_x_agent_1 = jnp.zeros(base_obs_shape).flatten()
     
     network_params_agent_0 = network.init(key_a_agent_0, init_x_agent_0)
     network_params_agent_1 = network.init(key_a_agent_1, init_x_agent_1)
@@ -243,8 +243,8 @@ def make_train(config):
         ego_obs_shape = base_obs_dim + env.action_space().n
         
         # Initialize networks with appropriate shapes
-        init_x_agent_0 = jnp.zeros(base_obs_shape).flatten()
-        init_x_agent_1 = jnp.zeros(ego_obs_shape).flatten()
+        init_x_agent_0 = jnp.zeros(ego_obs_shape).flatten()
+        init_x_agent_1 = jnp.zeros(base_obs_shape).flatten()
         
         network_params_agent_0 = network.init(_rng_agent_0, init_x_agent_0)
         network_params_agent_1 = network.init(_rng_agent_1, init_x_agent_1)
