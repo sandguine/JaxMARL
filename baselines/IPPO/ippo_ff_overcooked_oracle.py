@@ -75,7 +75,6 @@ class ActorCritic(nn.Module):
 
         return pi, jnp.squeeze(critic, axis=-1)
     
-
 class Transition(NamedTuple):
     """Container for storing experience transitions"""
     done: jnp.ndarray      # Episode termination flag
@@ -218,7 +217,6 @@ def batchify(x: dict,
         batched_obs[agent] = data.reshape((num_actors // len(agent_list), -1))
     return batched_obs
 
-
 def unbatchify(x: jnp.ndarray, 
                agent_list: list, 
                num_envs: int, 
@@ -245,7 +243,7 @@ def unbatchify(x: jnp.ndarray,
         unbatched_obs[agent] = data
     return unbatched_obs
 
-def make_train(config):
+def make_train(config: dict) -> callable:
     """Creates the main training function with the given config"""
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
@@ -273,7 +271,7 @@ def make_train(config):
         transition_steps=config["REW_SHAPING_HORIZON"]
     )
 
-    def train(rng):
+    def train(rng: jnp.ndarray) -> dict:
         """Main training loop"""
         # Shapes we're initializing with
         print("Action space:", env.action_space().n)
@@ -323,9 +321,9 @@ def make_train(config):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         
         # TRAIN LOOP
-        def _update_step(runner_state, unused):
+        def _update_step(runner_state: tuple, unused: None) -> tuple:
             # COLLECT TRAJECTORIES
-            def _env_step(runner_state, unused):
+            def _env_step(runner_state: tuple, unused: None) -> tuple:
                 train_state, env_state, last_obs, update_step, rng = runner_state
 
                 # SELECT ACTION consistently with training initialization
@@ -399,12 +397,14 @@ def make_train(config):
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
             _, last_val = network.apply(train_state.params, last_obs_batch)
 
-            def _calculate_gae(traj_batch, last_val):
+            def _calculate_gae(traj_batch: tuple, 
+                               last_val: jnp.ndarray) -> tuple:
                 # Inner function that processes one transition at a time
                 print("traj_batch types:", jax.tree_map(lambda x: x.dtype, traj_batch))
                 print("last_val types:", jax.tree_map(lambda x: x.dtype, last_val))
                 
-                def _get_advantages(gae_and_next_value, transition):
+                def _get_advantages(gae_and_next_value: tuple, 
+                                    transition: Transition) -> tuple:
                     # Unpack the carried state (previous GAE and next state's value)
                     gae, next_value = gae_and_next_value
                     # Get current transition info
@@ -455,11 +455,16 @@ def make_train(config):
             advantages, targets = _calculate_gae(traj_batch, last_val)
             
             # UPDATE NETWORK
-            def _update_epoch(update_state, unused):
-                def _update_minbatch(train_state, batch_info):
+            def _update_epoch(update_state: tuple, 
+                               unused: None) -> tuple:
+                def _update_minbatch(train_state: TrainState, 
+                                     batch_info: tuple) -> tuple:
                     traj_batch, advantages, targets = batch_info
 
-                    def _loss_fn(params, traj_batch, gae, targets):
+                    def _loss_fn(params, 
+                                 traj_batch: tuple, 
+                                 gae: jnp.ndarray, 
+                                 targets: jnp.ndarray) -> tuple:
                         # RERUN NETWORK
                         pi, value = network.apply(params, traj_batch.obs)
                         log_prob = pi.log_prob(traj_batch.action)
@@ -542,7 +547,7 @@ def make_train(config):
             
             rng = update_state[-1]
 
-            def callback(metric):
+            def callback(metric: dict) -> None:
                 wandb.log(
                     metric
                 )
