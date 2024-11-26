@@ -85,7 +85,8 @@ class Transition(NamedTuple):
     log_prob: jnp.ndarray  # Log probability of action
     obs: jnp.ndarray       # Observation
 
-def get_rollout(train_state, config):
+def get_rollout(train_state: TrainState, 
+                config: dict) -> list:
     """Generate a single episode rollout for visualization"""
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
@@ -155,18 +156,23 @@ def get_rollout(train_state, config):
 
     return state_seq
 
-def batchify(x: dict, agent_list, num_actors):
+def batchify(x: dict, 
+            agent_list: list, 
+            num_actors: int) -> dict:
     """Convert dict of agent observations to batched array"""
     x = jnp.stack([x[a] for a in agent_list])
     return x.reshape((num_actors, -1))
 
 
-def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
+def unbatchify(x: jnp.ndarray, 
+               agent_list: list, 
+               num_envs: int, 
+               num_actors: int) -> dict:
     """Convert batched array back to dict of agent observations"""
     x = x.reshape((num_actors, num_envs, -1))
     return {a: x[i] for i, a in enumerate(agent_list)}
 
-def make_train(config):
+def make_train(config: dict) -> callable:
     """Creates the main training function with the given config"""
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
@@ -182,7 +188,7 @@ def make_train(config):
     
     env = LogWrapper(env, replace_info=False)
     
-    def linear_schedule(count):
+    def linear_schedule(count: int) -> float:
         """Learning rate annealing schedule"""
         frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
         return config["LR"] * frac
@@ -194,7 +200,7 @@ def make_train(config):
         transition_steps=config["REW_SHAPING_HORIZON"]
     )
 
-    def train(rng):
+    def train(rng: jnp.ndarray) -> dict:
         """Main training loop"""
         # Initialize network and optimizer
         network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
@@ -226,9 +232,9 @@ def make_train(config):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         
         # TRAIN LOOP
-        def _update_step(runner_state, unused):
+        def _update_step(runner_state: tuple, unused: None) -> tuple:
             # COLLECT TRAJECTORIES
-            def _env_step(runner_state, unused):
+            def _env_step(runner_state: tuple, unused: None) -> tuple:
                 train_state, env_state, last_obs, update_step, rng = runner_state
 
                 # SELECT ACTION
@@ -287,12 +293,13 @@ def make_train(config):
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
             _, last_val = network.apply(train_state.params, last_obs_batch)
 
-            def _calculate_gae(traj_batch, last_val):
+            def _calculate_gae(traj_batch: tuple, last_val: jnp.ndarray) -> tuple:
                 # Inner function that processes one transition at a time
                 print("traj_batch types:", jax.tree_map(lambda x: x.dtype, traj_batch))
                 print("last_val types:", jax.tree_map(lambda x: x.dtype, last_val))
-                
-                def _get_advantages(gae_and_next_value, transition):
+
+                def _get_advantages(gae_and_next_value: tuple, 
+                                    transition: Transition) -> tuple:
                     # Unpack the carried state (previous GAE and next state's value)
                     gae, next_value = gae_and_next_value
                     # Get current transition info
@@ -343,11 +350,15 @@ def make_train(config):
             advantages, targets = _calculate_gae(traj_batch, last_val)
             
             # UPDATE NETWORK
-            def _update_epoch(update_state, unused):
-                def _update_minbatch(train_state, batch_info):
+            def _update_epoch(update_state: tuple, unused: None) -> tuple:
+                def _update_minbatch(train_state: TrainState, 
+                                     batch_info: tuple) -> tuple:
                     traj_batch, advantages, targets = batch_info
 
-                    def _loss_fn(params, traj_batch, gae, targets):
+                    def _loss_fn(params: dict, 
+                                 traj_batch: tuple, 
+                                 gae: jnp.ndarray, 
+                                 targets: jnp.ndarray) -> tuple:
                         # RERUN NETWORK
                         pi, value = network.apply(params, traj_batch.obs)
                         log_prob = pi.log_prob(traj_batch.action)
@@ -430,7 +441,7 @@ def make_train(config):
             
             rng = update_state[-1]
 
-            def callback(metric):
+            def callback(metric: dict) -> None:
                 wandb.log(
                     metric
                 )
@@ -455,7 +466,7 @@ def make_train(config):
 
 
 @hydra.main(version_base=None, config_path="config", config_name="ippo_ff_overcooked_oracle")
-def main(config):
+def main(config: dict) -> None:
     """Main entry point for training"""
     # Process config
     config = OmegaConf.to_container(config) 

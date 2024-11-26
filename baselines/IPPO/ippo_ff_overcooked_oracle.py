@@ -85,7 +85,8 @@ class Transition(NamedTuple):
     log_prob: jnp.ndarray  # Log probability of action
     obs: jnp.ndarray       # Observation
 
-def get_rollout(train_state, config):
+def get_rollout(train_state: TrainState, 
+                config: dict) -> list:
     """Generate a single episode rollout for visualization"""
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
@@ -105,12 +106,12 @@ def get_rollout(train_state, config):
     base_obs_shape = env.observation_space().shape
     print("base_obs_shape:", base_obs_shape)
     print("action_space:", env.action_space().n)
-    ego_obs_shape = (*base_obs_shape[:-1], base_obs_shape[-1] + env.action_space().n)
-    print("ego_obs_shape:", ego_obs_shape)
+    augmented_obs_shape = (*base_obs_shape[:-1], base_obs_shape[-1] + env.action_space().n)
+    print("augmented_obs_shape:", augmented_obs_shape)
     
     # Initialize networks with appropriate shapes
     init_x_agent_1 = jnp.zeros(base_obs_shape).flatten()
-    init_x_agent_0 = jnp.zeros(ego_obs_shape).flatten()
+    init_x_agent_0 = jnp.zeros(augmented_obs_shape).flatten()
     
     network_params_agent_1 = network.init(key_a_agent_1, init_x_agent_1)
     network_params_agent_0 = network.init(key_a_agent_0, init_x_agent_0)
@@ -166,7 +167,11 @@ def get_rollout(train_state, config):
 
     return state_seq
 
-def preprocess_observation(agent, obs, agent_1_action=None, action_dim=None):
+def preprocess_observation(
+    agent: str, 
+    obs: jnp.ndarray, 
+    agent_1_action: jnp.ndarray, 
+    action_dim: int) -> jnp.ndarray:
     """
     Preprocesses observations based on the agent type.
     
@@ -187,7 +192,11 @@ def preprocess_observation(agent, obs, agent_1_action=None, action_dim=None):
         return jnp.concatenate([obs, one_hot_action], axis=-1)
     return obs
 
-def batchify(x: dict, agent_list, num_actors, preprocess=None, action_dim=None):
+def batchify(x: dict, 
+            agent_list: list, 
+            num_actors: int, 
+            preprocess: callable=None, 
+            action_dim: int=None) -> dict:
     """
     Batchify observations or other data with optional preprocessing.
     
@@ -210,7 +219,11 @@ def batchify(x: dict, agent_list, num_actors, preprocess=None, action_dim=None):
     return batched_obs
 
 
-def unbatchify(x: jnp.ndarray, agent_list, num_envs, preprocess=None, action_dim=None):
+def unbatchify(x: jnp.ndarray, 
+               agent_list: list, 
+               num_envs: int, 
+               preprocess: callable=None, 
+               action_dim: int=None) -> dict:
     """
     Convert batched arrays back to a dictionary of agent-specific data.
 
