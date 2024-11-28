@@ -383,8 +383,9 @@ def make_train(config):
             last_val = jnp.array([agent_1_last_val, agent_0_last_val])
             print("stacked last_val shape:", last_val.shape)
 
+            # calculate_gae itself didn't need to be changed because we can use the same advantage function for both agents
             def _calculate_gae(traj_batch, last_val):
-                """Calculate GAE per agent"""
+                """Calculate GAE"""
                 print(f"\nGAE Calculation Debug:")
                 print("traj_batch types:", jax.tree_map(lambda x: x.dtype, traj_batch))
                 print(f"traj_batch shapes:", jax.tree_map(lambda x: x.shape, traj_batch))
@@ -451,6 +452,7 @@ def make_train(config):
                     print(f"advantages: {advantages.shape}")
                     print(f"targets: {targets.shape}")
 
+                    # Loss function itself didn't need to be changed because we can use the same loss function for both agents
                     def _loss_fn(params, traj_batch, gae, targets):
                         # RERUN NETWORK
                         print("\nCalculating losses...")
@@ -497,17 +499,35 @@ def make_train(config):
                         print(f"Total loss: {total_loss}")
                         return total_loss, (value_loss, loss_actor, entropy)
 
-                    grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    total_loss, grads = grad_fn(
-                        train_state.params, traj_batch, advantages, targets
+                    # Separate updates for each agent
+                    grad_fn_0 = jax.value_and_grad(_loss_fn, has_aux=True)
+                    grad_fn_1 = jax.value_and_grad(_loss_fn, has_aux=True)
+
+                    # Update agent_0
+                    total_loss_0, grads_0 = grad_fn_0(
+                        train_state.params['agent_0'], 0, traj_batch, advantages, targets
                     )
+    
+                    # Update agent_1
+                    total_loss_1, grads_1 = grad_fn_1(
+                        train_state.params['agent_1'], 1, traj_batch, advantages, targets
+                    )
+                    
                     print("\nGradient stats:")
-                    print(f"Grad norm: {optax.global_norm(grads)}")
-                    train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
+                    print(f"Grad norm agent_0: {optax.global_norm(grads_0)}")
+                    print(f"Grad norm agent_1: {optax.global_norm(grads_1)}")
+                    # Apply gradients separately for each agent
+                    train_state = train_state.replace(
+                        params={
+                            'agent_0': train_state.tx.update(grads_0, train_state.params['agent_0'])[0],
+                            'agent_1': train_state.tx.update(grads_1, train_state.params['agent_1'])[0]
+                        }
+                    )
+                    return train_state, (total_loss_0, total_loss_1)
 
                 train_state, traj_batch, advantages, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
+
                 batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
                 assert (
                     batch_size == config["NUM_STEPS"] * config["NUM_ACTORS"]
