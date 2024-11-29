@@ -317,6 +317,8 @@ def make_train(config):
                     'agent_0': agent_0_obs_augmented,
                     'agent_1': agent_1_obs
                 }
+                print("Processed agent_0 obs shape:", processed_obs['agent_0'].shape)
+                print("Processed agent_1 obs shape:", processed_obs['agent_1'].shape)
 
                 # Package actions for environment step
                 env_act = {
@@ -593,10 +595,13 @@ def make_train(config):
                     }
                 }
 
-                print("\nBatch processing:")
-                print("batch_size:", batch_size)
-                print("Original batch structure:", jax.tree_map(lambda x: x.shape, agent_data))
+                print("\nBatch processing, Pre-reshape diagnostics:")
+                print("agent_0 obs structure:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else type(x), agent_data['agent_0']['traj'].obs))
+                print("agent_1 obs structure:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else type(x), agent_data['agent_1']['traj'].obs))
+                print("Advantages shape:", advantages.shape)
+                print("Targets shape:", targets.shape)
 
+                
                 # Reshape each agent's data
                 for agent in ['agent_0', 'agent_1']:
                     agent_data[agent] = jax.tree_map(
@@ -609,7 +614,11 @@ def make_train(config):
                         )[1] if isinstance(x, jnp.ndarray) else x,
                         agent_data[agent]
                     )
-                print("Reshaped batch structure:", jax.tree_map(lambda x: x.shape, agent_data))
+
+                # After reshaping:
+                print("\nPost-reshape diagnostics:")
+                print("Reshaped agent_0 obs:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else type(x), agent_data['agent_0']['traj'].obs))
+                print("Reshaped agent_1 obs:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else type(x), agent_data['agent_1']['traj'].obs))
 
                 # Create permutation for shuffling
                 permutation = jax.random.permutation(_rng, batch_size)
