@@ -182,6 +182,10 @@ def make_train(config):
     
     env = LogWrapper(env, replace_info=False)
     
+    # Learning rate and reward shaping annealing schedules
+    # The learning rate is annealed linearly over the course of training because
+    # if the learning rate is too high, the model can diverge.
+    # By making the learning rate decay linearly, we can ensure that the model can converge.
     def linear_schedule(count):
         """Learning rate annealing schedule"""
         frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
@@ -194,6 +198,9 @@ def make_train(config):
         transition_steps=config["REW_SHAPING_HORIZON"]
     )
 
+
+    # This is the main training loop where the training starts.
+    # It initializes network with: correct number of parameters, optimizer, and learning rate annealing.
     def train(rng):
         """Main training loop"""
         # Initialize network and optimizer
@@ -226,8 +233,13 @@ def make_train(config):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         
         # TRAIN LOOP
+        # This function manages full update iteration including:
+        # - collecting trajectories in _env_step
+        # - calculating advantages in _calculate_gae
+        # - updating the network in _update_epoch
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
+            # This function handle single environment step and collets transitions
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, update_step, rng = runner_state
 
@@ -287,6 +299,8 @@ def make_train(config):
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
             _, last_val = network.apply(train_state.params, last_obs_batch)
 
+            # This function calculates the advantage for each transition in the trajectory (basically, policy optimization).
+            # It returns the advantages and value targets.
             def _calculate_gae(traj_batch, last_val):
                 # Inner function that processes one transition at a time
                 print(f"\nGAE Calculation Debug:")
@@ -295,6 +309,7 @@ def make_train(config):
                 print("last_val types:", jax.tree_map(lambda x: x.dtype, last_val))
                 print(f"last_val shape: {last_val.shape}")
                 
+                # This function calculates the advantage for each transition in the trajectory.
                 def _get_advantages(gae_and_next_value, transition):
                     # Unpack the carried state (previous GAE and next state's value)
                     gae, next_value = gae_and_next_value
@@ -349,9 +364,11 @@ def make_train(config):
             advantages, targets = _calculate_gae(traj_batch, last_val)
             
             # UPDATE NETWORK
+            # This function performs multiple optimization steps on the collected trajectories.
             def _update_epoch(update_state, unused):
+                # This function updates the network using the collected trajectories, 
+                #advantages, and value targets for a single epoch.
                 def _update_minbatch(train_state, batch_info):
-                    print("\nStarting minibatch update...")
                     traj_batch, advantages, targets = batch_info
                     print("Minibatch shapes:")
                     print(f"traj_batch: {jax.tree_map(lambda x: x.shape, traj_batch)}")

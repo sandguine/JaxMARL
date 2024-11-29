@@ -86,7 +86,6 @@ class ActorCritic(nn.Module):
 
         return pi, jnp.squeeze(critic, axis=-1)
     
-
 class Transition(NamedTuple):
     """Container for storing experience transitions"""
     done: jnp.ndarray      # Episode termination flag
@@ -444,13 +443,34 @@ def make_train(config):
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
+                """
+                Performs a complete training epoch for both agents.
+                
+                Args:
+                    update_state: Tuple containing (train_state, traj_batch, advantages, targets, rng)
+                    unused: Placeholder for scan compatibility
+                    
+                Returns:
+                    Updated state and loss information
+                """
                 def _update_minbatch(train_state, batch_info):
+                    """Updates network parameters using a minibatch of experience.
+                    
+                    Args:
+                        train_state: Current training state containing both agents' parameters
+                        batch_info: Tuple of (traj_batch, advantages, targets) for both agents
+                        
+                    Returns:
+                        Updated training state and loss information
+                    """
                     print("\nStarting minibatch update...")
-                    traj_batch, advantages, targets = batch_info
+                    # Unpack batch_info which now contains separate agent data
+                    agent_0_data, agent_1_data = batch_info['agent_0'], batch_info['agent_1']
+                    
                     print("Minibatch shapes:")
-                    print(f"traj_batch: {jax.tree_map(lambda x: x.shape, traj_batch)}")
-                    print(f"advantages: {advantages.shape}")
-                    print(f"targets: {targets.shape}")
+                    print("Agent 0 data:", jax.tree_map(lambda x: x.shape, agent_0_data))
+                    print("Agent 1 data:", jax.tree_map(lambda x: x.shape, agent_1_data))
+
 
                     # Loss function itself didn't need to be changed because we can use the same loss function for both agents
                     def _loss_fn(params, traj_batch, gae, targets):
@@ -499,92 +519,115 @@ def make_train(config):
                         print(f"Total loss: {total_loss}")
                         return total_loss, (value_loss, loss_actor, entropy)
 
-                    # Separate updates for each agent
-                    grad_fn_0 = jax.value_and_grad(_loss_fn, has_aux=True)
-                    grad_fn_1 = jax.value_and_grad(_loss_fn, has_aux=True)
-
-                    # Update agent_0
-                    total_loss_0, grads_0 = grad_fn_0(
-                        train_state.params['agent_0'], 0, traj_batch, advantages, targets
+                    # Create gradient function for both agents
+                    grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+    
+                    # Compute gradients for agent 0
+                    (loss_0, aux_0), grads_0 = grad_fn(
+                        train_state.params['agent_0'],
+                        agent_0_data['traj'],
+                        agent_0_data['advantages'],
+                        agent_0_data['targets']
                     )
     
-                    # Update agent_1
-                    total_loss_1, grads_1 = grad_fn_1(
-                        train_state.params['agent_1'], 1, traj_batch, advantages, targets
+                    # Compute gradients for agent 1
+                    (loss_1, aux_1), grads_1 = grad_fn(
+                        train_state.params['agent_1'],
+                        agent_1_data['traj'],
+                        agent_1_data['advantages'],
+                        agent_1_data['targets']
                     )
-                    
+    
                     print("\nGradient stats:")
                     print(f"Grad norm agent_0: {optax.global_norm(grads_0)}")
                     print(f"Grad norm agent_1: {optax.global_norm(grads_1)}")
-                    # Apply gradients separately for each agent
+                    
+                    # Update both agents' parameters separately
                     train_state = train_state.replace(
                         params={
                             'agent_0': train_state.tx.update(grads_0, train_state.params['agent_0'])[0],
                             'agent_1': train_state.tx.update(grads_1, train_state.params['agent_1'])[0]
                         }
                     )
-                    return train_state, (total_loss_0, total_loss_1)
+    
+                    # Combine losses for logging
+                    total_loss = loss_0 + loss_1
+                    combined_aux = jax.tree_map(lambda x, y: (x + y) / 2, aux_0, aux_1)
+                    
+                    return train_state, (total_loss, combined_aux)
 
                 train_state, traj_batch, advantages, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
 
-                batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
+                # Calculate total batch size and minibatch size
+                batch_size = config["NUM_STEPS"] * config["NUM_ENVS"]
+                config["MINIBATCH_SIZE"] = batch_size // config["NUM_MINIBATCHES"]
+
+                # Verify that the data can be evenly split into minibatches
                 assert (
-                    batch_size == config["NUM_STEPS"] * config["NUM_ACTORS"]
-                ), "batch size must be equal to number of steps * number of actors"
-                permutation = jax.random.permutation(_rng, batch_size)
-                batch = (traj_batch, advantages, targets)
+                    batch_size % config["NUM_MINIBATCHES"] == 0
+                ), "Steps * Envs must be divisible by number of minibatches"
+
+                # Separate data for each agent
+                agent_data = {
+                    'agent_0': {
+                        'traj': jax.tree_util.tree_map(
+                            lambda x: x["agent_0"] if isinstance(x, dict) else x[0],
+                            traj_batch
+                        ),
+                        'advantages': advantages[0],
+                        'targets': targets[0]
+                    },
+                    'agent_1': {
+                        'traj': jax.tree_util.tree_map(
+                            lambda x: x["agent_1"] if isinstance(x, dict) else x[1],
+                            traj_batch
+                        ),
+                        'advantages': advantages[1],
+                        'targets': targets[1]
+                    }
+                }
+
                 print("\nBatch processing:")
                 print("batch_size:", batch_size)
                 print("Original batch structure:", jax.tree_map(lambda x: x.shape, batch))
-                batch = jax.tree_map(
-                    lambda x: (
-                        print(f"Reshaping array with shape {x.shape} to ({config['NUM_STEPS']}, {config['NUM_ACTORS']}, -1)"),
-                        x.reshape((config["NUM_STEPS"], config["NUM_ACTORS"], -1))
-                    )[1] if isinstance(x, jnp.ndarray) 
-                    else (
-                        print(f"Skipping reshape for non-array type {type(x)}"),
-                        x
-                    )[1]
-                    , batch
-                )
-                print("Reshaped batch structure:", jax.tree_map(lambda x: x.shape, batch))
-                
-                # Special handling for observations dictionary
-                if isinstance(traj_batch.obs, dict):
-                    batch[0].obs = {
-                        agent: obs.reshape((config["NUM_STEPS"], -1))
-                        for agent, obs in traj_batch.obs.items()
-                    }
 
-                # Create permutation that keeps agent pairs together
-                permutation = jax.random.permutation(_rng, config["NUM_STEPS"])
+                # Reshape each agent's data
+                for agent in ['agent_0', 'agent_1']:
+                    agent_data[agent] = jax.tree_map(
+                        lambda x: (
+                            print(f"Reshaping {agent} data {x.shape} to {(batch_size,) + x.shape[2:]}"),
+                            x.reshape((batch_size,) + x.shape[2:])
+                        )[1] if isinstance(x, jnp.ndarray) else x,
+                        agent_data[agent]
+                    )
+                print("Reshaped batch structure:", jax.tree_map(lambda x: x.shape, agent_data))
+
+                # Create permutation for shuffling
+                permutation = jax.random.permutation(_rng, batch_size)
                 
-                # Shuffle while keeping agent pairs together
-                shuffled_batch = jax.tree_map(
-                    lambda x: (
-                        jnp.take(x, permutation, axis=0) 
-                        if isinstance(x, jnp.ndarray) 
-                        else x
-                    ),
-                    batch
-                )
-                print("Shuffled batch structure:", jax.tree_map(lambda x: x.shape, shuffled_batch))
-                
+                # Shuffle each agent's data independently
+                for agent in ['agent_0', 'agent_1']:
+                    agent_data[agent] = jax.tree_map(
+                        lambda x: jnp.take(x, permutation, axis=0) if isinstance(x, jnp.ndarray) else x,
+                        agent_data[agent]
+                    )
+                print("Shuffled batch structure:", jax.tree_map(lambda x: x.shape, agent_data))
+
+                # Create minibatches for each agent
                 minibatches = jax.tree_map(
-                    lambda x: (
-                        jnp.reshape(
-                            x, 
-                            [config["NUM_MINIBATCHES"], -1, num_agents, x.shape[-1]]
-                        ) if isinstance(x, jnp.ndarray) else x
-                    ),
-                    shuffled_batch
+                    lambda x: jnp.reshape(
+                        x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
+                    ) if isinstance(x, jnp.ndarray) else x,
+                    agent_data
                 )
                 print("Minibatches structure:", jax.tree_map(lambda x: x.shape, minibatches))
-                
+
+                # Update networks using minibatches
                 train_state, total_loss = jax.lax.scan(
-                    _update_minbatch, train_state, minibatches
+                    _update_minibatch, train_state, minibatches
                 )
+
                 update_state = (train_state, traj_batch, advantages, targets, rng)
                 return update_state, total_loss
 
