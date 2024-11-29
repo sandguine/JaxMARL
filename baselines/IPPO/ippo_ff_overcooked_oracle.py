@@ -28,72 +28,118 @@ import wandb
 
 import matplotlib.pyplot as plt
 
+from functools import partial
 
 class ActorCritic(nn.Module):
-    """Neural network architecture implementing both policy (actor) and value function (critic)"""
+    """Neural network architecture implementing both policy (actor) and value function (critic)
+
+    Attributes:
+        action_dim: Dimension of action space
+        activation: Activation function to use (either "relu" or "tanh")
+    """
     action_dim: Sequence[int]  # Dimension of action space
     activation: str = "tanh"   # Activation function to use
 
+    def setup(self):
+        """Initialize layers and activation function.
+        This runs once when the model is created.
+        """
+        # Store activation function
+        self.act_fn = nn.relu if self.activation == "relu" else nn.tanh
+
+        # Initialize dense layers with consistent naming
+        self.actor_dense1 = nn.Dense(
+            64, 
+            kernel_init=orthogonal(np.sqrt(2)), 
+            bias_init=constant(0.0),
+            name="actor_dense1"
+        )
+        self.actor_dense2 = nn.Dense(
+            64,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="actor_dense2"
+        )
+        self.actor_out = nn.Dense(
+            self.action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
+            name="actor_out"
+        )
+
+        # Critic network layers
+        self.critic_dense1 = nn.Dense(
+            64,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="critic_dense1"
+        )
+        self.critic_dense2 = nn.Dense(
+            64,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="critic_dense2"
+        )
+        self.critic_out = nn.Dense(
+            1,
+            kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0),
+            name="critic_out"
+        )
+
     @nn.compact
     def __call__(self, x):
-        print("network input x shape:", x.shape)  # Debug print for input shape
+        """Forward pass of the network.
         
-        # Select activation function based on config
-        if self.activation == "relu":
-            activation = nn.relu
-        else:
-            activation = nn.tanh
-
-        # Actor network - outputs action probabilities
+        Args:
+            x: Input tensor with shape (batch_size, input_dim)
+               where input_dim is either base_obs_dim or base_obs_dim + action_dim
+               
+        Returns:
+            Tuple of (action distribution, value estimate)
+        """
+        # Print debug information about input shape
+        print("Network input x shape:", x.shape)
         print("ActorCritic input shape:", x.shape)
+        
+        # Expected input dimension is the last dimension of the input tensor
+        expected_dim = x.shape[-1] if len(x.shape) > 1 else x.shape[0]
+        print(f"Expected input dim: {expected_dim}")
 
-        # Check input dimensions
-        if len(x.shape) == 1:
-            expected_dim = x.shape[0]
-        else:
-            expected_dim = x.shape[-1]
-        print(f"Expected input dim: {expected_dim}")  # Debug print
+        # Actor network
+        actor = self.actor_dense1(x)
+        actor = self.act_fn(actor)
+        actor = self.actor_dense2(actor)
+        actor = self.act_fn(actor)
+        actor = self.actor_out(actor)
+        pi = distrax.Categorical(logits=actor)
 
-
-        actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(actor_mean)
-        actor_mean = activation(actor_mean)
-        # Final layer outputs logits for each possible action
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)
-        # Convert logits to categorical distribution
-        pi = distrax.Categorical(logits=actor_mean)
-
-        # Critic network - outputs value function estimate
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        critic = activation(critic)
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(critic)
-        critic = activation(critic)
-        # Final layer outputs single value estimate
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
+        # Critic network
+        critic = self.critic_dense1(x)
+        critic = self.act_fn(critic)
+        critic = self.critic_dense2(critic)
+        critic = self.act_fn(critic)
+        critic = self.critic_out(critic)
 
         return pi, jnp.squeeze(critic, axis=-1)
     
 class Transition(NamedTuple):
-    """Container for storing experience transitions"""
-    done: jnp.ndarray      # Episode termination flag
-    action: jnp.ndarray    # Action taken
-    value: jnp.ndarray     # Value function estimate
-    reward: jnp.ndarray    # Reward received
-    log_prob: jnp.ndarray  # Log probability of action
-    obs: jnp.ndarray       # Observation
+    """Container for storing experience transitions
+
+    Attributes:
+        done: Episode termination flag
+        action: Actual action taken by the agent
+        value: Value function estimate
+        reward: Reward received
+        log_prob: Log probability of action
+        obs: Observation
+    """
+    done: jnp.ndarray
+    action: jnp.ndarray
+    value: jnp.ndarray
+    reward: jnp.ndarray
+    log_prob: jnp.ndarray
+    obs: jnp.ndarray
 
 def get_rollout(train_state, config):
     """Generate a single episode rollout for visualization.
@@ -108,13 +154,33 @@ def get_rollout(train_state, config):
     Returns:
         Episode trajectory data including states, rewards, and shaped rewards
     """
+    if "DIMS" not in config:
+        raise ValueError("Config is missing DIMS dictionary. Check that dimensions were properly initialized in main()")
+    
+    # Unpack dimensions from config at the start of the function
+    dims = config["DIMS"]
+    
+    print("\nRollout Dimensions:")
+    print(f"Base observation shape: {dims['base_obs_shape']} -> {dims['base_obs_dim']}")
+    print(f"Action dimension: {dims['action_dim']}")
+    print(f"Augmented observation dim: {dims['augmented_obs_dim']}\n")
+
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     # env_params = env.default_params
     # env = LogWrapper(env)
 
+    # Verify dimensions match configuration
+    assert np.prod(env.observation_space().shape) == dims["base_obs_dim"], \
+        "Observation dimension mismatch in rollout"
+    assert env.action_space().n == dims["action_dim"], \
+        "Action dimension mismatch in rollout"
+
     # Initialize network
-    network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+    network = ActorCritic(
+        action_dim=dims["action_dim"],  # Use dimension from config
+        activation=config["ACTIVATION"]
+    )
     
     # Initialize seeds
     key = jax.random.PRNGKey(0)
@@ -123,17 +189,10 @@ def get_rollout(train_state, config):
     key_a_agent_0, key_a_agent_1 = jax.random.split(key_a)
     # key_r for environment reset
     # key for future episode steps
-
-    # Get observation shapes
-    base_obs_shape = env.observation_space().shape
-    print("base_obs_shape:", base_obs_shape)
-    print("action_space:", env.action_space().n)
-    ego_obs_shape = (*base_obs_shape[:-1], base_obs_shape[-1] + env.action_space().n)
-    print("ego_obs_shape:", ego_obs_shape)
     
-    # Initialize networks with appropriate shapes
-    init_x_agent_0 = jnp.zeros(ego_obs_shape).flatten()
-    init_x_agent_1 = jnp.zeros(base_obs_shape).flatten()
+    # Initialize networks with correct dimensions from config
+    init_x_agent_0 = jnp.zeros(dims["augmented_obs_dim"])  # Agent 0 gets augmented obs
+    init_x_agent_1 = jnp.zeros(dims["base_obs_dim"])       # Agent 1 gets base obs
     
     network_params_agent_0 = network.init(key_a_agent_0, init_x_agent_0)
     network_params_agent_1 = network.init(key_a_agent_1, init_x_agent_1)
@@ -150,23 +209,29 @@ def get_rollout(train_state, config):
     while not done:
         key, key_a0, key_a1, key_s = jax.random.split(key, 4)
 
-        # obs_batch = batchify(obs, env.agents, config["NUM_ACTORS"])
-        # breakpoint()
+        # First process agent_1 (uses base observation)
+        agent_1_obs = obs["agent_1"].flatten()
+        pi_1, _ = network.apply(network_params_agent_1, agent_1_obs)
+        action_1 = pi_1.sample(seed=key_a1)
 
-        # Flatten observations for network input
-        obs = {k: v.flatten() for k, v in obs.items()}
+        # Then process agent_0 with augmented observation
+        agent_0_obs = obs["agent_0"].flatten()
+        # Create one-hot encoding of agent_1's action
+        one_hot_action = jax.nn.one_hot(action_1, dims["action_dim"])
+        # Concatenate base observation with action encoding
+        agent_0_obs_augmented = jnp.concatenate([agent_0_obs, one_hot_action])
+        
+        # Verify dimensions
+        assert agent_0_obs_augmented.shape[-1] == dims["augmented_obs_dim"], \
+            f"Agent 0 augmented obs mismatch: expected {dims['augmented_obs_dim']}, got {agent_0_obs_augmented.shape[-1]}"
+        
+        pi_0, _ = network.apply(network_params_agent_0, agent_0_obs_augmented)
+        action_0 = pi_0.sample(seed=key_a0)
 
-        print("agent_0 obs shape:", obs["agent_0"].shape)
-        print("agent_1 obs shape:", obs["agent_1"].shape)
-
-        # Get actions from policy for both agents
-        pi_0, _ = network.apply(network_params_agent_0, obs["agent_0"])
-        pi_1, _ = network.apply(network_params_agent_1, obs["agent_1"])
-
-        actions = {"agent_0": pi_0.sample(seed=key_a0), "agent_1": pi_1.sample(seed=key_a1)}
-        print("actions:", actions.shape)
-        # env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
-        # env_act = {k: v.flatten() for k, v in env_act.items()}
+        actions = {
+            "agent_0": action_0,
+            "agent_1": action_1
+        }
 
         # Step environment forward
         obs, state, reward, done, info = env.step(key_s, state, actions)
@@ -236,6 +301,7 @@ def make_train(config):
     Args:
         config: Dictionary containing training hyperparameters and environment settings
                including:
+               - DIMS: Environment dimensions
                - ENV_NAME: Name of environment to train in
                - ENV_KWARGS: Environment configuration parameters
                - NUM_ENVS: Number of parallel environments
@@ -249,7 +315,12 @@ def make_train(config):
     """
     
     # Initialize environment
+    dims = config["DIMS"]
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+
+    # Verify dimensions match what we validated in main
+    assert np.prod(env.observation_space().shape) == dims["base_obs_dim"], "Observation dimension mismatch"
+    assert env.action_space().n == dims["action_dim"], "Action dimension mismatch"
 
     # Calculate key training parameters
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
@@ -267,6 +338,8 @@ def make_train(config):
     print(f"NUM_UPDATES: {config['NUM_UPDATES']}")
     print(f"NUM_MINIBATCHES: {config['NUM_MINIBATCHES']}")
     print(f"TOTAL_TIMESTEPS: {config['TOTAL_TIMESTEPS']}")
+    print(f"ENV_NAME: {config['ENV_NAME']}")
+    print(f"DIMS: {config['DIMS']}")
     
     env = LogWrapper(env, replace_info=False)
     
@@ -319,21 +392,19 @@ def make_train(config):
         print("Action space:", env.action_space().n)
         print("Observation space shape:", env.observation_space().shape)
 
-        # Initialize network and optimizer
-        network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+        # Initialize network with fixed action dimension
+        network = ActorCritic(
+            action_dim=dims["action_dim"],  # Use dimension from config
+            activation=config["ACTIVATION"]
+        )
 
         # Initialize seeds
         rng, _rng = jax.random.split(rng)
         _rng_agent_0, _rng_agent_1 = jax.random.split(_rng)  # Split for two networks
-        
-        # Get observation shapes
-        base_obs_shape = env.observation_space().shape
-        base_obs_dim = np.prod(base_obs_shape)
-        ego_obs_shape = base_obs_dim + env.action_space().n
-        
-        # Initialize networks with appropriate shapes
-        init_x_agent_0 = jnp.zeros(ego_obs_shape).flatten()
-        init_x_agent_1 = jnp.zeros(base_obs_shape).flatten()
+
+        # Initialize networks with correct dimensions from config
+        init_x_agent_0 = jnp.zeros(dims["augmented_obs_dim"])  # Agent 0 gets augmented obs
+        init_x_agent_1 = jnp.zeros(dims["base_obs_dim"])       # Agent 1 gets base obs
         
         network_params_agent_0 = network.init(_rng_agent_0, init_x_agent_0)
         network_params_agent_1 = network.init(_rng_agent_1, init_x_agent_1)
@@ -418,7 +489,7 @@ def make_train(config):
                     - Metrics dictionary with training statistics
             """
             # COLLECT TRAJECTORIES
-            def _env_step(runner_state, unused):
+            def _env_step(runner_state, unused, dims=dims):
                 """Collects trajectories by running the current policy in the environment.
                 
                 This function performs one step of environment interaction for each agent,
@@ -433,6 +504,8 @@ def make_train(config):
                         - rng: Random number generator state
 
                     unused: Placeholder parameter for JAX scan compatibility
+
+                    dims: Environment dimensions
                     
                 Returns:
                     Tuple containing:
@@ -450,13 +523,14 @@ def make_train(config):
                 print("Original agent_1 obs shape:", last_obs['agent_1'].shape)
                 agent_1_obs = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
                 print("agent_1 obs shape:", agent_1_obs.shape)
-                agent_1_pi, agent_1_value = network.apply(train_state.params['agent_1'], agent_1_obs)
+                agent_1_pi, agent_1_value = network.apply(train_state['agent_1'].params, agent_1_obs)
                 print("agent_1_value shape:", agent_1_value.shape)
                 agent_1_action = agent_1_pi.sample(seed=_rng_agent_1)
                 print("agent_1 action shape:", agent_1_action.shape)
                 agent_1_log_prob = agent_1_pi.log_prob(agent_1_action)
                 print("agent_1 log prob shape:", agent_1_log_prob.shape)
 
+                
                 # agent_0 step - augmenting observation with agent_1 action
                 print("\nAgent_0 shapes:")
                 print("Original agent_0 obs shape:", last_obs['agent_0'].shape)
@@ -469,12 +543,34 @@ def make_train(config):
                     one_hot_action
                 ], axis=-1)
                 print("agent_0_obs_augmented shape:", agent_0_obs_augmented.shape)
-                agent_0_pi, agent_0_value = network.apply(train_state.params['agent_0'], agent_0_obs_augmented)
+                agent_0_pi, agent_0_value = network.apply(train_state['agent_0'].params, agent_0_obs_augmented)
                 print("agent_0_value shape:", agent_0_value.shape)
                 agent_0_action = agent_0_pi.sample(seed=_rng_agent_0)
                 print("agent_0_action_shape:", agent_0_action.shape)
                 agent_0_log_prob = agent_0_pi.log_prob(agent_0_action)
                 print("agent_0_log_prob_shape:", agent_0_log_prob.shape)
+
+                print("\nObservation processing debug:")
+                print(f"Original obs shapes:")
+                print(f"  Agent 0: {last_obs['agent_0'].shape}")
+                print(f"  Agent 1: {last_obs['agent_1'].shape}")
+                
+                print(f"\nFlattened obs shapes:")
+                print(f"  Agent 0: {agent_0_obs.shape}")
+                print(f"  Agent 1: {agent_1_obs.shape}")
+                
+                print(f"\nAugmented obs shape:")
+                print(f"  Agent 0: {agent_0_obs_augmented.shape}")
+
+                # Add shape checks
+                print("\nDimension checks:")
+                # Correct dimension checks
+                assert agent_0_obs.shape[-1] == dims["base_obs_dim"], \
+                    f"Agent 0 base obs dimension mismatch: expected {dims['base_obs_dim']}, got {agent_0_obs.shape[-1]}"
+                assert agent_1_obs.shape[-1] == dims["base_obs_dim"], \
+                    f"Agent 1 base obs dimension mismatch: expected {dims['base_obs_dim']}, got {agent_1_obs.shape[-1]}"
+                assert agent_0_obs_augmented.shape[-1] == dims["augmented_obs_dim"], \
+                    f"Agent 0 augmented obs dimension mismatch: expected {dims['augmented_obs_dim']}, got {agent_0_obs_augmented.shape[-1]}"
 
                 processed_obs = {
                     'agent_0': agent_0_obs_augmented,
@@ -540,14 +636,14 @@ def make_train(config):
             # Calculate last values for both agents
             print("\nCalculating last values:")
             last_obs_agent1 = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
-            _, agent_1_last_val = network.apply(train_state.params['agent_1'], last_obs_agent1)
+            _, agent_1_last_val = network.apply(train_state['agent_1'].params, last_obs_agent1)
             print("agent_1_last_val shape:", agent_1_last_val.shape)
 
             # For agent_0, need to include agent_1's last action in observation
             one_hot_last_action = jax.nn.one_hot(traj_batch.action[-1, 1], env.action_space().n)
             last_obs_agent0 = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
             last_obs_agent0_augmented = jnp.concatenate([last_obs_agent0, one_hot_last_action], axis=-1)
-            _, agent_0_last_val = network.apply(train_state.params['agent_0'], last_obs_agent0_augmented)
+            _, agent_0_last_val = network.apply(train_state['agent_0'].params, last_obs_agent0_augmented)
             print("agent_0_last_val shape:", agent_0_last_val.shape)
 
             # Combine values for advantage calculation
@@ -677,7 +773,7 @@ def make_train(config):
 
 
                     # Loss function itself didn't need to be changed because we can use the same loss function for both agents
-                    def _loss_fn(params, traj_batch, gae, targets):
+                    def _loss_fn(params, traj_batch, gae, targets, agent_type):
                         """Calculate loss for a single agent.
                         
                         This function computes the loss for a single agent, which is used
@@ -695,7 +791,8 @@ def make_train(config):
                                 - Auxiliary loss information (value loss, actor loss, entropy)
                         """
                         # RERUN NETWORK
-                        print("\nCalculating losses...")
+                        print(f"\nCalculating losses for {agent_type}...")
+                        print(f"Input obs shape: {traj_batch.obs.shape}")
                         pi, value = network.apply(params, traj_batch.obs)
                         print(f"Network outputs - pi shape: {pi.batch_shape}, value shape: {value.shape}")
                         log_prob = pi.log_prob(traj_batch.action)
@@ -710,7 +807,6 @@ def make_train(config):
                         value_loss = (
                             0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                         )
-                        print(f"Value loss: {value_loss}")
 
                         # CALCULATE ACTOR LOSS
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
@@ -729,30 +825,46 @@ def make_train(config):
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
-                        print(f"Actor loss: {loss_actor}, Entropy: {entropy}")
 
                         total_loss = (
                             loss_actor
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
                         )
-                        print(f"Total loss: {total_loss}")
-                        return total_loss, (value_loss, loss_actor, entropy)
+                        loss_info = {
+                            'value_loss': value_loss,
+                            'actor_loss': loss_actor,
+                            'entropy': entropy,
+                            'total_loss': total_loss,
+                            'grad_norm': None  # Will be filled later
+                        }
+                        
+                        print(f"\nLoss breakdown for {agent_type}:")
+                        for k, v in loss_info.items():
+                            if v is not None:
+                                print(f"{k}: {v}")
+                        
+                        return total_loss, loss_info
 
-                    # Create gradient function for both agents
-                    grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+                    # Create separate loss functions for each agent
+                    loss_fn_agent_0 = partial(_loss_fn, agent_type='agent_0')
+                    loss_fn_agent_1 = partial(_loss_fn, agent_type='agent_1')
+
+                    # Create gradient functions
+                    grad_fn_0 = jax.value_and_grad(loss_fn_agent_0, has_aux=True)
+                    grad_fn_1 = jax.value_and_grad(loss_fn_agent_1, has_aux=True)
     
                     # Compute gradients for agent 0
-                    (loss_0, aux_0), grads_0 = grad_fn(
-                        train_state.params['agent_0'],
+                    (loss_0, aux_0), grads_0 = grad_fn_0(
+                        train_state['agent_0'].params,
                         agent_0_data['traj'],
                         agent_0_data['advantages'],
                         agent_0_data['targets']
                     )
     
                     # Compute gradients for agent 1
-                    (loss_1, aux_1), grads_1 = grad_fn(
-                        train_state.params['agent_1'],
+                    (loss_1, aux_1), grads_1 = grad_fn_1(
+                        train_state['agent_1'].params,
                         agent_1_data['traj'],
                         agent_1_data['advantages'],
                         agent_1_data['targets']
@@ -763,12 +875,10 @@ def make_train(config):
                     print(f"Grad norm agent_1: {optax.global_norm(grads_1)}")
                     
                     # Update both agents' parameters separately
-                    train_state = train_state.replace(
-                        params={
-                            'agent_0': train_state.tx.update(grads_0, train_state.params['agent_0'])[0],
-                            'agent_1': train_state.tx.update(grads_1, train_state.params['agent_1'])[0]
-                        }
-                    )
+                    train_state = {
+                        'agent_0': train_state['agent_0'].apply_gradients(grads=grads_0),
+                        'agent_1': train_state['agent_1'].apply_gradients(grads=grads_1)
+                    }
     
                     # Combine losses for logging
                     total_loss = loss_0 + loss_1
@@ -983,11 +1093,49 @@ def make_train(config):
 
 @hydra.main(version_base=None, config_path="config", config_name="ippo_ff_overcooked_oracle")
 def main(config):
-    """Main entry point for training"""
+    """Main entry point for training
+    
+    Args:
+        config: Hydra configuration object containing training parameters
+        
+    Returns:
+        Training results and metrics
+    
+    Raises:
+        ValueError: If the environment dimensions are invalid
+    """
+    # Validate config
+    required_keys = ["ENV_NAME", "ENV_KWARGS"]
+    for key in required_keys:
+        if key not in config:
+            raise ValueError(f"Missing required config key: {key}")
+
     # Process config
-    config = OmegaConf.to_container(config) 
+    config = OmegaConf.to_container(config)
     layout_name = config["ENV_KWARGS"]["layout"]
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
+
+    # Create environment using JaxMARL framework
+    env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+
+    # Get environment dimensions
+    base_obs_shape = env.observation_space().shape
+    base_obs_dim = int(np.prod(base_obs_shape))
+    action_dim = int(env.action_space().n)
+    augmented_obs_dim = base_obs_dim + action_dim
+
+    # Validate dimensions
+    assert base_obs_dim > 0, f"Invalid base observation dimension: {base_obs_dim}"
+    assert action_dim > 0, f"Invalid action dimension: {action_dim}"
+    assert augmented_obs_dim > base_obs_dim, "Augmented dim must be larger than base dim"
+
+    # Store dimensions in config for easy access
+    config["DIMS"] = {
+        "base_obs_shape": base_obs_shape,
+        "base_obs_dim": base_obs_dim,
+        "action_dim": action_dim,
+        "augmented_obs_dim": augmented_obs_dim
+    }
 
     # Initialize wandb logging
     wandb.init(
@@ -1004,6 +1152,15 @@ def main(config):
     rngs = jax.random.split(rng, config["NUM_SEEDS"])    
     train_jit = jax.jit(make_train(config))
     out = jax.vmap(train_jit)(rngs)
+
+    print("\nVerifying config before rollout:")
+    print("Config keys:", config.keys())
+    if "DIMS" in config:
+        print("Found dimensions:")
+        for key, value in config["DIMS"].items():
+            print(f"  {key}: {value}")
+    else:
+        raise ValueError("DIMS not found in config - check dimension initialization")
 
     # Generate visualization
     filename = f'{config["ENV_NAME"]}_{layout_name}'
