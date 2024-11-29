@@ -96,7 +96,18 @@ class Transition(NamedTuple):
     obs: jnp.ndarray       # Observation
 
 def get_rollout(train_state, config):
-    """Generate a single episode rollout for visualization"""
+    """Generate a single episode rollout for visualization.
+    
+    Runs a single episode in the environment using the current policy networks to generate
+    actions. Used for visualizing agent behavior during training.
+    
+    Args:
+        train_state: Current training state containing network parameters
+        config: Dictionary containing environment and training configuration
+        
+    Returns:
+        Episode trajectory data including states, rewards, and shaped rewards
+    """
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     # env_params = env.default_params
@@ -178,16 +189,64 @@ def get_rollout(train_state, config):
     return state_seq
 
 def batchify(x: dict, agent_list, num_actors):
+    """Batchify observations for a single agent.
+    
+    This function stacks the observations for a single agent across multiple environments,
+    reshaping them into a single array with shape (num_actors, -1).
+
+    Args:
+        x: Dictionary containing observations for a single agent
+        agent_list: List of agent names
+        num_actors: Number of parallel environments
+
+    Returns:
+        Batched observations with shape (num_actors, -1)
+    """
     x = jnp.stack([x[a] for a in agent_list])
     return x.reshape((num_actors, -1))
 
 def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
-    """Convert batched array back to dict of agent observations"""
+    """Convert batched array back to dict of agent observations.
+    
+    This function reshapes the batched array back to a dictionary of observations for
+    each agent, with shape (num_envs, -1).
+
+    Args:
+        x: Batched observations with shape (num_actors, num_envs, -1)
+        agent_list: List of agent names
+        num_envs: Number of parallel environments
+        num_actors: Number of actors (agents)
+
+    Returns:
+        Dictionary containing observations for each agent
+    """
     x = x.reshape((num_actors, num_envs, -1))
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 def make_train(config):
-    """Creates the main training function with the given config"""
+    """Creates the main training function for IPPO with the given configuration.
+    
+    This function sets up the training environment, networks, and optimization process
+    for training multiple agents using Independent PPO (IPPO). It handles:
+    - Environment initialization and wrapping
+    - Network architecture setup for both agents
+    - Learning rate scheduling and reward shaping annealing
+    - Training loop configuration including batch sizes and update schedules
+    
+    Args:
+        config: Dictionary containing training hyperparameters and environment settings
+               including:
+               - ENV_NAME: Name of environment to train in
+               - ENV_KWARGS: Environment configuration parameters
+               - NUM_ENVS: Number of parallel environments
+               - NUM_STEPS: Number of steps per training iteration
+               - TOTAL_TIMESTEPS: Total environment steps to train for
+               - Learning rates, batch sizes, and other optimization parameters
+               
+    Returns:
+        train: The main training function that takes an RNG key and executes the full
+               training loop, returning the trained agent policies
+    """
     
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
@@ -212,7 +271,19 @@ def make_train(config):
     env = LogWrapper(env, replace_info=False)
     
     def linear_schedule(count):
-        """Learning rate annealing schedule"""
+        """Linear learning rate annealing schedule that decays over training.
+        
+        Calculates a learning rate multiplier that decreases linearly from 1.0 to 0.0
+        over the course of training. Used to gradually reduce the learning rate to help
+        convergence.
+        
+        Args:
+            count: Current training step count used to calculate progress through training
+        
+        Returns:
+            float: The current learning rate after applying the annealing schedule,
+                  calculated as: base_lr * (1 - training_progress)
+        """
         frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
         return config["LR"] * frac
     
@@ -224,7 +295,26 @@ def make_train(config):
     )
 
     def train(rng):
-        """Main training loop"""
+        """Main training loop for Independent PPO (IPPO) algorithm.
+        
+        Implements the core training loop for training multiple agents using IPPO.
+        Handles network initialization, environment setup, and training iteration.
+        
+        Args:
+            rng: JAX random number generator key for reproducibility
+            
+        Returns:
+            Tuple containing:
+            - Final trained network parameters for both agents
+            - Training metrics and statistics
+            - Environment states from training
+            
+        The training process:
+        1. Initializes separate policy networks for each agent
+        2. Collects experience in parallel environments
+        3. Updates policies using PPO with independent value functions
+        4. Tracks and logs training metrics
+        """
         # Shapes we're initializing with
         print("Action space:", env.action_space().n)
         print("Observation space shape:", env.observation_space().shape)
@@ -248,24 +338,53 @@ def make_train(config):
         network_params_agent_0 = network.init(_rng_agent_0, init_x_agent_0)
         network_params_agent_1 = network.init(_rng_agent_1, init_x_agent_1)
         
-        # Setup optimizer with optional learning rate annealing
-        if config["ANNEAL_LR"]:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
+        def create_optimizer(config):
+            """Creates an optimizer chain for training each agent's neural network.
+            
+            The optimizer chain consists of:
+            1. Gradient clipping using global norm
+            2. Adam optimizer with either:
+            - Annealed learning rate that decays linearly over training
+            - Fixed learning rate specified in config
+            
+            Args:
+                config: Dictionary containing optimization parameters like:
+                    - ANNEAL_LR: Whether to use learning rate annealing
+                    - MAX_GRAD_NORM: Maximum gradient norm for clipping
+                    - LR: Base learning rate
+                    
+            Returns:
+                optax.GradientTransformation: The composed optimizer chain
+            """
+            if config["ANNEAL_LR"]:
+                tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),  # First transformation
+                    optax.adam(learning_rate=linear_schedule, eps=1e-5)  # Second transformation
+                )
+            else:
+                tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                    optax.adam(config["LR"], eps=1e-5)
+                )
+            return tx
+
+        # Create separate optimizer chains for each agent
+        tx_agent_0 = create_optimizer(config)
+        tx_agent_1 = create_optimizer(config)
+
+        # Create separate train states
+        train_state = {
+            'agent_0': TrainState.create(
+                apply_fn=network.apply,
+                params=network_params_agent_0,
+                tx=tx_agent_0
+            ),
+            'agent_1': TrainState.create(
+                apply_fn=network.apply,
+                params=network_params_agent_1,
+                tx=tx_agent_1
             )
-        else:
-            tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["LR"], eps=1e-5))
-        
-        # Create combined train state structure
-        train_state = TrainState.create(
-            apply_fn=network.apply,
-            params={
-                'agent_0': network_params_agent_0,
-                'agent_1': network_params_agent_1
-            },
-            tx=tx,
-        )
+        }
         
         # Initialize environment states
         rng, _rng = jax.random.split(rng)
@@ -274,8 +393,52 @@ def make_train(config):
         
         # TRAIN LOOP
         def _update_step(runner_state, unused):
+            """Executes a single training update step in the IPPO algorithm.
+            
+            This function performs one complete update iteration including:
+            1. Collecting trajectories by running the current policy in the environment
+            2. Computing advantages and returns
+            3. Updating both agents' neural networks using PPO
+            
+            The update handles both agents (agent_0 and agent_1) separately, with agent_0
+            receiving augmented observations that include agent_1's actions.
+            
+            Args:
+                runner_state: Tuple containing:
+                    - train_state: Current training state with network parameters
+                    - env_state: Current environment state
+                    - last_obs: Previous observations from environment
+                    - update_step: Current training iteration number
+                    - rng: Random number generator state
+                unused: Placeholder parameter for JAX scan compatibility
+                
+            Returns:
+                Tuple containing:
+                    - Updated runner_state
+                    - Metrics dictionary with training statistics
+            """
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
+                """Collects trajectories by running the current policy in the environment.
+                
+                This function performs one step of environment interaction for each agent,
+                collecting trajectories for training.
+
+                Args:
+                    runner_state: Tuple containing:
+                        - train_state: Current training state with network parameters
+                        - env_state: Current environment state
+                        - last_obs: Previous observations from environment
+                        - update_step: Current training iteration number
+                        - rng: Random number generator state
+
+                    unused: Placeholder parameter for JAX scan compatibility
+                    
+                Returns:
+                    Tuple containing:
+                        - Updated runner_state
+                        - Trajectory batch, info, and processed observations
+                """
                 train_state, env_state, last_obs, update_step, rng = runner_state
 
                 # SELECT ACTION consistently with training initialization
@@ -393,7 +556,20 @@ def make_train(config):
 
             # calculate_gae itself didn't need to be changed because we can use the same advantage function for both agents
             def _calculate_gae(traj_batch, last_val):
-                """Calculate GAE"""
+                """Calculate Generalized Advantage Estimation (GAE) for trajectories.
+                
+                This function computes the GAE for a given trajectory batch and last value,
+                which are used to estimate the advantage of each action in the trajectory.
+
+                Args:
+                    traj_batch: Trajectory batch containing transitions
+                    last_val: Last value estimates for the trajectory
+                    
+                Returns:
+                    Tuple containing:
+                        - Advantages for the trajectory
+                        - Returns (advantages + value estimates)
+                """
                 print(f"\nGAE Calculation Debug:")
                 print("traj_batch types:", jax.tree_map(lambda x: x.dtype, traj_batch))
                 print(f"traj_batch shapes:", jax.tree_map(lambda x: x.shape, traj_batch))
@@ -402,6 +578,20 @@ def make_train(config):
                 
 
                 def _get_advantages(gae_and_next_value, transition):
+                    """Calculate GAE and returns for a single transition.
+                    
+                    This function computes the GAE and returns for a single transition,
+                    which are used to update the policy and value functions.
+                    
+                    Args:
+                        gae_and_next_value: Tuple containing current GAE and next value
+                        transition: Single transition containing data for one step
+                    
+                    Returns:
+                        Tuple containing:
+                            - Updated GAE and next value
+                            - Calculated GAE
+                    """
                     gae, next_value = gae_and_next_value
                     
                     done, value, reward = (
@@ -488,6 +678,22 @@ def make_train(config):
 
                     # Loss function itself didn't need to be changed because we can use the same loss function for both agents
                     def _loss_fn(params, traj_batch, gae, targets):
+                        """Calculate loss for a single agent.
+                        
+                        This function computes the loss for a single agent, which is used
+                        to update the policy and value functions.
+                        
+                        Args:
+                            params: Network parameters for the agent
+                            traj_batch: Trajectory batch containing transitions
+                            gae: Generalized Advantage Estimation (GAE) for the trajectory
+                            targets: Target values (advantages + value estimates) for the trajectory
+                        
+                        Returns:
+                            Tuple containing:
+                                - Total loss for the agent
+                                - Auxiliary loss information (value loss, actor loss, entropy)
+                        """
                         # RERUN NETWORK
                         print("\nCalculating losses...")
                         pi, value = network.apply(params, traj_batch.obs)
@@ -619,7 +825,32 @@ def make_train(config):
 
                 # Reshape function that handles the different observation sizes
                 def reshape_agent_data(agent_dict):
+                    """Reshape trajectory data for a single agent.
+                    
+                    This function reshapes the trajectory data for a single agent,
+                    ensuring that the observations are reshaped correctly while keeping
+                    the features dimension intact.
+                    
+                    Args:
+                        agent_dict: Dictionary containing trajectory data for an agent
+                    
+                    Returns:
+                        Dictionary containing reshaped trajectory data
+                    """
                     def reshape_field(x, field_name):
+                        """Reshape a single field of the trajectory data.
+                        
+                        This function reshapes a single field of the trajectory data,
+                        ensuring that the observations are reshaped correctly while keeping
+                        the features dimension intact.
+
+                        Args:
+                            x: Data to be reshaped
+                            field_name: Name of the field to be reshaped
+                        
+                        Returns:
+                            Reshaped data
+                        """
                         if not isinstance(x, (dict, jnp.ndarray)):
                             return x
                             
@@ -670,6 +901,17 @@ def make_train(config):
 
                 # Create minibatches
                 def create_minibatches(data):
+                    """Create minibatches from trajectory data.
+                    
+                    This function divides the trajectory data into smaller minibatches,
+                    which are used for training the policy and value networks.
+                    
+                    Args:
+                        data: Dictionary containing trajectory data for an agent
+                    
+                    Returns:
+                        Dictionary containing minibatched trajectory data
+                    """
                     return {
                         'traj': Transition(
                             **{field: jnp.reshape(getattr(data['traj'], field), 
@@ -708,6 +950,14 @@ def make_train(config):
             rng = update_state[-1]
 
             def callback(metric):
+                """Log training metrics to wandb.
+                
+                This function logs the training metrics to wandb, which are used for
+                monitoring and analysis during training.
+
+                Args:
+                    metric: Training metrics to be logged
+                """
                 wandb.log(
                     metric
                 )
