@@ -440,6 +440,11 @@ def make_train(config):
 
             # Calculate advantages 
             advantages, targets = _calculate_gae(traj_batch, last_val)
+            print("advantages shape:", advantages.shape)
+            print("targets shape:", targets.shape)
+            print("traj_batch value shape:", traj_batch.value.shape)
+            print("traj_batch reward shape:", traj_batch.reward.shape)
+            print("traj_batch data types:", jax.tree_map(lambda x: x.dtype, traj_batch))
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
@@ -568,23 +573,23 @@ def make_train(config):
                     batch_size % config["NUM_MINIBATCHES"] == 0
                 ), "Steps * Envs must be divisible by number of minibatches"
 
-                # Separate data for each agent
+                # Separate data for each agent, maintain the env dimension
                 agent_data = {
                     'agent_0': {
                         'traj': jax.tree_util.tree_map(
-                            lambda x: x["agent_0"] if isinstance(x, dict) else x[:, 0],  # Changed indexing
+                            lambda x: x["agent_0"] if isinstance(x, dict) else x[:, 0, :],  # Keep the env dimension
                             traj_batch
                         ),
-                        'advantages': advantages[:, 0],  # Changed indexing
-                        'targets': targets[:, 0]         # Changed indexing
+                        'advantages': advantages[:, 0, :],  # Keep the env dimension
+                        'targets': targets[:, 0, :]         # Keep the env dimension
                     },
                     'agent_1': {
                         'traj': jax.tree_util.tree_map(
-                            lambda x: x["agent_1"] if isinstance(x, dict) else x[:, 1],  # Changed indexing
+                            lambda x: x["agent_1"] if isinstance(x, dict) else x[:, 1, :],  # Keep the env dimension
                             traj_batch
                         ),
-                        'advantages': advantages[:, 1],  # Changed indexing
-                        'targets': targets[:, 1]         # Changed indexing
+                        'advantages': advantages[:, 1, :],  # Keep the env dimension
+                        'targets': targets[:, 1, :]         # Keep the env dimension
                     }
                 }
 
@@ -596,8 +601,11 @@ def make_train(config):
                 for agent in ['agent_0', 'agent_1']:
                     agent_data[agent] = jax.tree_map(
                         lambda x: (
-                            print(f"Reshaping {agent} data {x.shape} to {(batch_size,) + x.shape[2:]}"),
-                            x.reshape((batch_size,) + x.shape[2:])
+                            print(f"Reshaping {agent} data {x.shape} to {(batch_size, -1) if len(x.shape) > 2 else (batch_size,)}"),
+                            # Special handling for observations
+                            x.reshape((batch_size, -1)) if len(x.shape) > 2 
+                            # Regular reshaping for other data
+                            else x.reshape((batch_size,))
                         )[1] if isinstance(x, jnp.ndarray) else x,
                         agent_data[agent]
                     )
@@ -605,7 +613,6 @@ def make_train(config):
 
                 # Create permutation for shuffling
                 permutation = jax.random.permutation(_rng, batch_size)
-                
                 # Shuffle each agent's data independently
                 for agent in ['agent_0', 'agent_1']:
                     agent_data[agent] = jax.tree_map(
@@ -617,6 +624,7 @@ def make_train(config):
                 # Create minibatches for each agent
                 minibatches = jax.tree_map(
                     lambda x: jnp.reshape(
+                        # For observations and other multi-dimensional data
                         x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
                     ) if isinstance(x, jnp.ndarray) else x,
                     agent_data
