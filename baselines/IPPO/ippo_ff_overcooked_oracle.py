@@ -572,25 +572,25 @@ def make_train(config):
                 agent_data = {
                     'agent_0': {
                         'traj': jax.tree_util.tree_map(
-                            lambda x: x["agent_0"] if isinstance(x, dict) else x[0],
+                            lambda x: x["agent_0"] if isinstance(x, dict) else x[:, 0],  # Changed indexing
                             traj_batch
                         ),
-                        'advantages': advantages[0],
-                        'targets': targets[0]
+                        'advantages': advantages[:, 0],  # Changed indexing
+                        'targets': targets[:, 0]         # Changed indexing
                     },
                     'agent_1': {
                         'traj': jax.tree_util.tree_map(
-                            lambda x: x["agent_1"] if isinstance(x, dict) else x[1],
+                            lambda x: x["agent_1"] if isinstance(x, dict) else x[:, 1],  # Changed indexing
                             traj_batch
                         ),
-                        'advantages': advantages[1],
-                        'targets': targets[1]
+                        'advantages': advantages[:, 1],  # Changed indexing
+                        'targets': targets[:, 1]         # Changed indexing
                     }
                 }
 
                 print("\nBatch processing:")
                 print("batch_size:", batch_size)
-                print("Original batch structure:", jax.tree_map(lambda x: x.shape, batch))
+                print("Original batch structure:", jax.tree_map(lambda x: x.shape, agent_data))
 
                 # Reshape each agent's data
                 for agent in ['agent_0', 'agent_1']:
