@@ -317,6 +317,7 @@ def make_train(config):
                     'agent_0': agent_0_obs_augmented,
                     'agent_1': agent_1_obs
                 }
+                print("\nProcessed obs shapes:")
                 print("Processed agent_0 obs shape:", processed_obs['agent_0'].shape)
                 print("Processed agent_1 obs shape:", processed_obs['agent_1'].shape)
 
@@ -325,7 +326,13 @@ def make_train(config):
                     "agent_0": agent_0_action,
                     "agent_1": agent_1_action
                 }
+                print("\nEnv act shapes before flattening:")
+                print("Env act agent_0 shape:", env_act['agent_0'].shape)
+                print("Env act agent_1 shape:", env_act['agent_1'].shape)
                 env_act = {k:v.flatten() for k,v in env_act.items()}
+                print("\nEnv act shapes after flattening:")
+                print("Env act agent_0 shape:", env_act['agent_0'].shape)
+                print("Env act agent_1 shape:", env_act['agent_1'].shape)
                 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -575,23 +582,32 @@ def make_train(config):
                     batch_size % config["NUM_MINIBATCHES"] == 0
                 ), "Steps * Envs must be divisible by number of minibatches"
 
-                # Separate data for each agent, maintain the env dimension
+                # Separate data for each agent, separate the individual components of the transitions explicitly 
+                # to handle different observation size
                 agent_data = {
                     'agent_0': {
-                        'traj': jax.tree_util.tree_map(
-                            lambda x: x["agent_0"] if isinstance(x, dict) else x[:, 0, :],  # Keep the env dimension
-                            traj_batch
-                        ),
-                        'advantages': advantages[:, 0, :],  # Keep the env dimension
-                        'targets': targets[:, 0, :]         # Keep the env dimension
-                    },
+                    'traj': Transition(
+                        done=traj_batch.done[:, 0],           # Shape: (128, 16)
+                        action=traj_batch.action[:, 0],       # Shape: (128, 16)
+                        value=traj_batch.value[:, 0],         # Shape: (128, 16)
+                        reward=traj_batch.reward[:, 0],       # Shape: (128, 16)
+                        log_prob=traj_batch.log_prob[:, 0],   # Shape: (128, 16)
+                        obs=traj_batch.obs['agent_0']         # Shape: (128, 526)
+                    ),
+                    'advantages': advantages[:, 0],           # Shape: (128, 16)
+                    'targets': targets[:, 0]                  # Shape: (128, 16)
+                },
                     'agent_1': {
-                        'traj': jax.tree_util.tree_map(
-                            lambda x: x["agent_1"] if isinstance(x, dict) else x[:, 1, :],  # Keep the env dimension
-                            traj_batch
+                        'traj': Transition(
+                            done=traj_batch.done[:, 1],           # Shape: (128, 16)
+                            action=traj_batch.action[:, 1],       # Shape: (128, 16)
+                            value=traj_batch.value[:, 1],         # Shape: (128, 16)
+                            reward=traj_batch.reward[:, 1],       # Shape: (128, 16)
+                            log_prob=traj_batch.log_prob[:, 1],   # Shape: (128, 16)
+                            obs=traj_batch.obs['agent_1']         # Shape: (128, 520)
                         ),
-                        'advantages': advantages[:, 1, :],  # Keep the env dimension
-                        'targets': targets[:, 1, :]         # Keep the env dimension
+                        'advantages': advantages[:, 1],           # Shape: (128, 16)
+                        'targets': targets[:, 1]                  # Shape: (128, 16)
                     }
                 }
 
@@ -601,48 +617,79 @@ def make_train(config):
                 print("Advantages shape:", advantages.shape)
                 print("Targets shape:", targets.shape)
 
-                
+                # Reshape function that handles the different observation sizes
+                def reshape_agent_data(agent_dict):
+                    def reshape_field(x, field_name):
+                        if not isinstance(x, (dict, jnp.ndarray)):
+                            return x
+                            
+                        if field_name == 'obs':
+                            # Keep the features dimension intact, only combine timesteps and envs
+                            print(f"Reshaping {field_name} from {x.shape} to {(batch_size, -1)}")
+                            return x.reshape(batch_size, -1)
+                        else:
+                            # For other fields, flatten to (batch_size,)
+                            print(f"Reshaping {field_name} from {x.shape} to {(batch_size,)}")
+                            return x.reshape(batch_size)
+                            
+                    return {
+                        'traj': Transition(
+                            **{field: reshape_field(getattr(agent_dict['traj'], field), field)
+                               for field in agent_dict['traj']._fields}
+                        ),
+                        'advantages': agent_dict['advantages'].reshape(batch_size),
+                        'targets': agent_dict['targets'].reshape(batch_size)
+                    }
+
                 # Reshape each agent's data
-                for agent in ['agent_0', 'agent_1']:
-                    agent_data[agent] = jax.tree_map(
-                        lambda x: (
-                            print(f"Reshaping {agent} data {x.shape} to {(batch_size, -1) if len(x.shape) > 2 else (batch_size,)}"),
-                            # Special handling for observations
-                            x.reshape((batch_size, -1)) if len(x.shape) > 2 
-                            # Regular reshaping for other data
-                            else x.reshape((batch_size,))
-                        )[1] if isinstance(x, jnp.ndarray) else x,
-                        agent_data[agent]
-                    )
+                agent_data = {
+                    agent: reshape_agent_data(data)
+                    for agent, data in agent_data.items()
+                }
 
                 # After reshaping:
                 print("\nPost-reshape diagnostics:")
                 print("Reshaped agent_0 obs:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else type(x), agent_data['agent_0']['traj'].obs))
                 print("Reshaped agent_1 obs:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else type(x), agent_data['agent_1']['traj'].obs))
 
-                # Create permutation for shuffling
+                # Create permutation and shuffle
                 permutation = jax.random.permutation(_rng, batch_size)
-                # Shuffle each agent's data independently
-                for agent in ['agent_0', 'agent_1']:
-                    agent_data[agent] = jax.tree_map(
-                        lambda x: jnp.take(x, permutation, axis=0) if isinstance(x, jnp.ndarray) else x,
-                        agent_data[agent]
-                    )
-                print("Shuffled batch structure:", jax.tree_map(lambda x: x.shape, agent_data))
+                agent_data = {
+                    agent: {
+                        'traj': Transition(
+                            **{field: jnp.take(getattr(data['traj'], field), permutation, axis=0)
+                               for field in data['traj']._fields}
+                        ),
+                        'advantages': jnp.take(data['advantages'], permutation, axis=0),
+                        'targets': jnp.take(data['targets'], permutation, axis=0)
+                    }
+                    for agent, data in agent_data.items()
+                }
 
-                # Create minibatches for each agent
-                minibatches = jax.tree_map(
-                    lambda x: jnp.reshape(
-                        # For observations and other multi-dimensional data
-                        x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
-                    ) if isinstance(x, jnp.ndarray) else x,
-                    agent_data
-                )
-                print("Minibatches structure:", jax.tree_map(lambda x: x.shape, minibatches))
+                print("\nShuffled batch structure:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else type(x), agent_data))
+
+                # Create minibatches
+                def create_minibatches(data):
+                    return {
+                        'traj': Transition(
+                            **{field: jnp.reshape(getattr(data['traj'], field), 
+                                                [config["NUM_MINIBATCHES"], -1] + list(getattr(data['traj'], field).shape[1:]))
+                               for field in data['traj']._fields}
+                        ),
+                        'advantages': data['advantages'].reshape(config["NUM_MINIBATCHES"], -1),
+                        'targets': data['targets'].reshape(config["NUM_MINIBATCHES"], -1)
+                    }
+
+                minibatches = {
+                    agent: create_minibatches(data)
+                    for agent, data in agent_data.items()
+                }
+
+                print("\nMinibatches structure:", jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else type(x), minibatches))
 
                 # Update networks using minibatches
                 train_state, total_loss = jax.lax.scan(
-                    _update_minibatch, train_state, minibatches
+                    _update_minbatch, train_state, minibatches
                 )
 
                 update_state = (train_state, traj_batch, advantages, targets, rng)
