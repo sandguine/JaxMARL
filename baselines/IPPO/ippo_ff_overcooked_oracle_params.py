@@ -250,15 +250,41 @@ def make_train(config):
                 print(f"agent_0 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_0'])}")
                 print(f"agent_1 obs shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_1'])}")
 
-                obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+                # First reshape both observations and add action dimensions
+                agent_0_obs = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
+                agent_1_obs = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
 
-                print("obs_batch shape:", obs_batch.shape)
+                # Create zero action vector for agent_1's observation
+                zero_action = jnp.zeros((last_obs['agent_1'].shape[0], env.action_space().n))
+                agent_1_obs_augmented = jnp.concatenate([agent_1_obs, zero_action], axis=-1)
                 
-                pi, value = network.apply(train_state.params, obs_batch)
-                action = pi.sample(seed=_rng)
-                print("action shape:", action.shape)
-                print("action:", action)
-                log_prob = pi.log_prob(action)
+                # Get agent_1's action first using the shared parameters
+                pi_1, value_1 = network.apply(train_state.params, agent_1_obs_augmented)
+                action_1 = pi_1.sample(seed=_rng)
+                log_prob_1 = pi_1.log_prob(action_1)
+
+                # Now create agent_0's observation with agent_1's actual action
+                one_hot_action = jax.nn.one_hot(action_1, env.action_space().n)
+                agent_0_obs_augmented = jnp.concatenate([agent_0_obs, one_hot_action], axis=-1)
+                
+                # Get agent_0's action using the same shared parameters
+                pi_0, value_0 = network.apply(train_state.params, agent_0_obs_augmented)
+                action_0 = pi_0.sample(seed=_rng)
+                log_prob_0 = pi_0.log_prob(action_0)
+
+                # Combine actions for environment step
+                action = jnp.stack([action_0, action_1])
+                value = jnp.stack([value_0, value_1])
+                log_prob = jnp.stack([log_prob_0, log_prob_1])
+                # obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+
+                # print("obs_batch shape:", obs_batch.shape)
+                
+                # pi, value = network.apply(train_state.params, obs_batch)
+                # action = pi.sample(seed=_rng)
+                # print("action shape:", action.shape)
+                # print("action:", action)
+                # log_prob = pi.log_prob(action)
                 env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
                 
                 env_act = {k:v.flatten() for k,v in env_act.items()}
@@ -279,6 +305,11 @@ def make_train(config):
                 current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
                 reward = jax.tree.map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, info["shaped_reward"])
 
+                obs_batch = {
+                    'agent_0': agent_0_obs_augmented,
+                    'agent_1': agent_1_obs_augmented
+                }
+                
                 transition = Transition(
                     batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
                     action,
