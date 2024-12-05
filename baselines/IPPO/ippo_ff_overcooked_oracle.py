@@ -253,40 +253,40 @@ def get_rollout(train_state, config):
 
     return state_seq
 
-def batchify(x: dict, agent_list, num_actors):
-    """Batchify observations for a single agent.
+# def batchify(x: dict, agent_list, num_actors):
+#     """Batchify observations for a single agent.
     
-    This function stacks the observations for a single agent across multiple environments,
-    reshaping them into a single array with shape (num_actors, -1).
+#     This function stacks the observations for a single agent across multiple environments,
+#     reshaping them into a single array with shape (num_actors, -1).
 
-    Args:
-        x: Dictionary containing observations for a single agent
-        agent_list: List of agent names
-        num_actors: Number of parallel environments
+#     Args:
+#         x: Dictionary containing observations for a single agent
+#         agent_list: List of agent names
+#         num_actors: Number of parallel environments
 
-    Returns:
-        Batched observations with shape (num_actors, -1)
-    """
-    x = jnp.stack([x[a] for a in agent_list])
-    return x.reshape((num_actors, -1))
+#     Returns:
+#         Batched observations with shape (num_actors, -1)
+#     """
+#     x = jnp.stack([x[a] for a in agent_list])
+#     return x.reshape((num_actors, -1))
 
-def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
-    """Convert batched array back to dict of agent observations.
+# def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
+#     """Convert batched array back to dict of agent observations.
     
-    This function reshapes the batched array back to a dictionary of observations for
-    each agent, with shape (num_envs, -1).
+#     This function reshapes the batched array back to a dictionary of observations for
+#     each agent, with shape (num_envs, -1).
 
-    Args:
-        x: Batched observations with shape (num_actors, num_envs, -1)
-        agent_list: List of agent names
-        num_envs: Number of parallel environments
-        num_actors: Number of actors (agents)
+#     Args:
+#         x: Batched observations with shape (num_actors, num_envs, -1)
+#         agent_list: List of agent names
+#         num_envs: Number of parallel environments
+#         num_actors: Number of actors (agents)
 
-    Returns:
-        Dictionary containing observations for each agent
-    """
-    x = x.reshape((num_actors, num_envs, -1))
-    return {a: x[i] for i, a in enumerate(agent_list)}
+#     Returns:
+#         Dictionary containing observations for each agent
+#     """
+#     x = x.reshape((num_actors, num_envs, -1))
+#     return {a: x[i] for i, a in enumerate(agent_list)}
 
 def make_train(config):
     """Creates the main training function for IPPO with the given configuration.

@@ -29,55 +29,110 @@ import wandb
 import matplotlib.pyplot as plt
 
 class ActorCritic(nn.Module):
-    """Neural network architecture implementing both policy (actor) and value function (critic)"""
+    """Neural network architecture implementing both policy (actor) and value function (critic)
+
+    Attributes:
+        action_dim: Dimension of action space
+        activation: Activation function to use (either "relu" or "tanh")
+    """
     action_dim: Sequence[int]  # Dimension of action space
     activation: str = "tanh"   # Activation function to use
 
+    def setup(self):
+        """Initialize layers and activation function.
+        This runs once when the model is created.
+        """
+        # Store activation function
+        self.act_fn = nn.relu if self.activation == "relu" else nn.tanh
+
+        # Initialize dense layers with consistent naming
+        self.actor_dense1 = nn.Dense(
+            64, 
+            kernel_init=orthogonal(np.sqrt(2)), 
+            bias_init=constant(0.0),
+            name="actor_dense1"
+        )
+        self.actor_dense2 = nn.Dense(
+            64,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="actor_dense2"
+        )
+        self.actor_out = nn.Dense(
+            self.action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
+            name="actor_out"
+        )
+
+        # Critic network layers
+        self.critic_dense1 = nn.Dense(
+            64,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="critic_dense1"
+        )
+        self.critic_dense2 = nn.Dense(
+            64,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="critic_dense2"
+        )
+        self.critic_out = nn.Dense(
+            1,
+            kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0),
+            name="critic_out"
+        )
+
     @nn.compact
     def __call__(self, x):
-        print("network input x shape:", x.shape)  # Debug print for input shape
+        """Forward pass of the network.
         
-        # Select activation function based on config
-        if self.activation == "relu":
-            activation = nn.relu
-        else:
-            activation = nn.tanh
+        Args:
+            x: Input tensor with shape (batch_size, input_dim)
+               where input_dim is either base_obs_dim or base_obs_dim + action_dim
+               
+        Returns:
+            Tuple of (action distribution, value estimate)
+        """
+        # Print debug information about input shape
+        print("Network input x shape:", x.shape)
+        print("ActorCritic input shape:", x.shape)
+        
+        # Expected input dimension is the last dimension of the input tensor
+        expected_dim = x.shape[-1] if len(x.shape) > 1 else x.shape[0]
+        print(f"Expected input dim: {expected_dim}")
 
-        # Actor network - outputs action probabilities
-        actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(actor_mean)
-        actor_mean = activation(actor_mean)
-        # Final layer outputs logits for each possible action
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)
-        # Convert logits to categorical distribution
-        pi = distrax.Categorical(logits=actor_mean)
+        # Actor network
+        actor = self.actor_dense1(x)
+        actor = self.act_fn(actor)
+        actor = self.actor_dense2(actor)
+        actor = self.act_fn(actor)
+        actor = self.actor_out(actor)
+        pi = distrax.Categorical(logits=actor)
 
-        # Critic network - outputs value function estimate
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        critic = activation(critic)
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(critic)
-        critic = activation(critic)
-        # Final layer outputs single value estimate
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
+        # Critic network
+        critic = self.critic_dense1(x)
+        critic = self.act_fn(critic)
+        critic = self.critic_dense2(critic)
+        critic = self.act_fn(critic)
+        critic = self.critic_out(critic)
 
         return pi, jnp.squeeze(critic, axis=-1)
     
 
 class Transition(NamedTuple):
-    """Container for storing experience transitions"""
+    """Container for storing experience transitions
+
+    Attributes:
+        done: Episode termination flag
+        action: Actual action taken by the agent
+        value: Value function estimate
+        reward: Reward received
+        log_prob: Log probability of action
+        obs: Observation
+    """
     done: jnp.ndarray      # Episode termination flag
     action: jnp.ndarray    # Action taken
     value: jnp.ndarray     # Value function estimate
@@ -86,20 +141,32 @@ class Transition(NamedTuple):
     obs: jnp.ndarray       # Observation
 
 def get_rollout(train_state, config):
-    """Generate a single episode rollout for visualization"""
+    """Generate a single episode rollout for visualization.
+    
+    Runs a single episode in the environment using the current policy networks to generate
+    actions. Used for visualizing agent behavior during training.
+    
+    Args:
+        train_state: Current training state containing network parameters
+        config: Dictionary containing environment and training configuration
+        
+    Returns:
+        Episode trajectory data including states, rewards, and shaped rewards
+    """
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     # env_params = env.default_params
     # env = LogWrapper(env)
 
     # Initialize network
-    network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+    network = ActorCritic(env_dims["action_dim"], activation=config["ACTIVATION"])
     key = jax.random.PRNGKey(0)
     key, key_r, key_a = jax.random.split(key, 3)
 
     # Initialize observation
-    init_x = jnp.zeros(env.observation_space().shape)
+    init_x = jnp.zeros(env_dims["augmented_obs_dim"])
     init_x = init_x.flatten()
+    print("Augmented init_x shape:", init_x.shape)
 
     network.init(key_a, init_x)
     network_params = train_state.params
@@ -170,6 +237,12 @@ def make_train(config):
     """Creates the main training function with the given config"""
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    env_dims = {
+        "base_obs_shape": env.observation_space().shape,
+        "base_obs_dim": np.prod(env.observation_space().shape),
+        "action_dim": env.action_space().n,
+        "augmented_obs_dim": np.prod(env.observation_space().shape) + env.action_space().n
+    }
 
     # Calculate key training parameters
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
@@ -204,12 +277,14 @@ def make_train(config):
     def train(rng):
         """Main training loop"""
         # Initialize network and optimizer
-        network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
+        network = ActorCritic(env_dims["action_dim"], activation=config["ACTIVATION"])
         rng, _rng = jax.random.split(rng)
-        init_x = jnp.zeros(env.observation_space().shape)
+
+        # Initialize observation
+        init_x = jnp.zeros(env_dims["augmented_obs_dim"])
         
         init_x = init_x.flatten()
-        print("init_x shape:", init_x.shape)
+        print("Augmented init_x shape:", init_x.shape)
         
         network_params = network.init(_rng, init_x)
         
@@ -276,15 +351,16 @@ def make_train(config):
                 action = jnp.stack([action_0, action_1])
                 value = jnp.stack([value_0, value_1])
                 log_prob = jnp.stack([log_prob_0, log_prob_1])
-                # obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
 
-                # print("obs_batch shape:", obs_batch.shape)
+                # Store augmented observations for consistency
+                augmented_last_obs = {
+                    'agent_0': agent_0_obs_augmented,
+                    'agent_1': agent_1_obs_augmented
+                }
+
+                # Use augmented observations for calculating advantages later
+                obs_batch = batchify(augmented_last_obs, env.agents, config["NUM_ACTORS"], env_dims["action_dim"])
                 
-                # pi, value = network.apply(train_state.params, obs_batch)
-                # action = pi.sample(seed=_rng)
-                # print("action shape:", action.shape)
-                # print("action:", action)
-                # log_prob = pi.log_prob(action)
                 env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
                 
                 env_act = {k:v.flatten() for k,v in env_act.items()}
@@ -304,20 +380,16 @@ def make_train(config):
 
                 current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
                 reward = jax.tree.map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, info["shaped_reward"])
-
-                obs_batch = {
-                    'agent_0': agent_0_obs_augmented,
-                    'agent_1': agent_1_obs_augmented
-                }
                 
                 transition = Transition(
-                    batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    action,
-                    value,
-                    batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    log_prob,
-                    obs_batch,
+                    done=batchify(done, env.agents, config["NUM_ACTORS"], env_dims["action_dim"]).squeeze(),
+                    action=action,
+                    value=value,
+                    reward=batchify(reward, env.agents, config["NUM_ACTORS"], env_dims["action_dim"]).squeeze(),
+                    log_prob=log_prob,
+                    obs=obs_batch
                 )
+
                 runner_state = (train_state, env_state, obsv, update_step, rng)
                 return runner_state, (transition, info)
 
@@ -327,7 +399,7 @@ def make_train(config):
             
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, update_step, rng = runner_state
-            last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+            last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"], env_dims["action_dim"])
             _, last_val = network.apply(train_state.params, last_obs_batch)
 
             # This function calculates the advantage for each transition in the trajectory (basically, policy optimization).
@@ -358,6 +430,12 @@ def make_train(config):
                     print(f"reward shape: {reward.shape}")
                     print(f"next_value shape: {next_value.shape}")
                     print(f"gae shape: {gae.shape}")
+
+                    # # Reshape done and reward to match per-agent structure
+                    # done = done.reshape(2, 16, 7)    # (2 agents, 16 envs, 7 features)
+                    # reward = reward.reshape(2, 16, 7) # Same shape as done
+                    # value = value.reshape(2, 16)      # (2 agents, 16 envs)
+                    # next_value = next_value.reshape(2, 16) # Same as value
 
                     # Calculate TD error (temporal difference)
                     # δt = rt + γV(st+1) - V(st)
@@ -543,7 +621,7 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "FF", "Debug", "Oracle"],
+        tags=["IPPO", "FF", "Debug", "Oracle", "Params-shared"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f'ippo_ff_overcooked_{layout_name}'
