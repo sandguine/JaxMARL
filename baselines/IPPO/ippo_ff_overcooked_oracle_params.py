@@ -524,19 +524,19 @@ def make_train(config):
                 value = jnp.stack([value_0, value_1])
                 log_prob = jnp.stack([log_prob_0, log_prob_1])
 
-                # Store augmented observations for consistency
-                augmented_last_obs = {
+                # Store processed observations
+                processed_obs = {
                     'agent_0': agent_0_obs_augmented,
                     'agent_1': agent_1_obs_augmented
                 }
 
-                # Use augmented observations for calculating advantages later
-                obs_batch = batchify(augmented_last_obs, env.agents, config["NUM_ACTORS"], env_dims["action_dim"])
-                
-                env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
-                
-                env_act = {k:v.flatten() for k,v in env_act.items()}
-                
+                # Package actions for environment step
+                env_act = {
+                    "agent_0": action_0,
+                    "agent_1": action_1
+                }
+                env_act = {k: v.flatten() for k, v in env_act.items()}
+
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
@@ -553,18 +553,22 @@ def make_train(config):
                 current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
                 reward = jax.tree.map(lambda x,y: x+y*rew_shaping_anneal(current_timestep), reward, info["shaped_reward"])
                 
+                # Create transition with consistent ordering
                 transition = Transition(
-                    done=batchify(done, env.agents, config["NUM_ACTORS"], env_dims["action_dim"]).squeeze(),
-                    action=action,
-                    value=value,
-                    reward=batchify(reward, env.agents, config["NUM_ACTORS"], env_dims["action_dim"]).squeeze(),
-                    log_prob=log_prob,
-                    obs=obs_batch
+                    done=jnp.array([done["agent_1"], done["agent_0"]]).squeeze(),
+                    action=jnp.array([action_1, action_0]),
+                    value=jnp.array([value_1, value_0]),
+                    reward=jnp.array([
+                        reward["agent_1"],
+                        reward["agent_0"]
+                    ]).squeeze(),
+                    log_prob=jnp.array([log_prob_1, log_prob_0]),
+                    obs=processed_obs
                 )
 
                 runner_state = (train_state, env_state, obsv, update_step, rng)
-                return runner_state, (transition, info)
-
+                return runner_state, (transition, info, processed_obs)
+            
             runner_state, (traj_batch, info) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
@@ -577,6 +581,20 @@ def make_train(config):
             # This function calculates the advantage for each transition in the trajectory (basically, policy optimization).
             # It returns the advantages and value targets.
             def _calculate_gae(traj_batch, last_val):
+                """Calculate Generalized Advantage Estimation (GAE) for trajectories.
+                
+                This function computes the GAE for a given trajectory batch and last value,
+                which are used to estimate the advantage of each action in the trajectory.
+
+                Args:
+                    traj_batch: Trajectory batch containing transitions
+                    last_val: Last value estimates for the trajectory
+                    
+                Returns:
+                    Tuple containing:
+                        - Advantages for the trajectory
+                        - Returns (advantages + value estimates)
+                """
                 # Inner function that processes one transition at a time
                 print(f"\nGAE Calculation Debug:")
                 print("traj_batch types:", jax.tree_map(lambda x: x.dtype, traj_batch))
@@ -586,6 +604,20 @@ def make_train(config):
                 
                 # This function calculates the advantage for each transition in the trajectory.
                 def _get_advantages(gae_and_next_value, transition):
+                    """Calculate GAE and returns for a single transition.
+                    
+                    This function computes the GAE and returns for a single transition,
+                    which are used to update the policy and value functions.
+                    
+                    Args:
+                        gae_and_next_value: Tuple containing current GAE and next value
+                        transition: Single transition containing data for one step
+                    
+                    Returns:
+                        Tuple containing:
+                            - Updated GAE and next value
+                            - Calculated GAE
+                    """
                     # Unpack the carried state (previous GAE and next state's value)
                     gae, next_value = gae_and_next_value
                     # Get current transition info
@@ -647,9 +679,26 @@ def make_train(config):
             # UPDATE NETWORK
             # This function performs multiple optimization steps on the collected trajectories.
             def _update_epoch(update_state, unused):
-                # This function updates the network using the collected trajectories, 
-                #advantages, and value targets for a single epoch.
+                """
+                Performs a complete training epoch.
+                
+                Args:
+                    update_state: Tuple containing (train_state, traj_batch, advantages, targets, rng)
+                    unused: Placeholder for scan compatibility
+                    
+                Returns:
+                    Updated state and loss information
+                """
                 def _update_minbatch(train_state, batch_info):
+                    """Updates network parameters using a minibatch of experience.
+                    
+                    Args:
+                        train_state: Current training state containing both agents' parameters
+                        batch_info: Tuple of (traj_batch, advantages, targets) for both agents
+                        
+                    Returns:
+                        Updated training state and loss information
+                    """
                     traj_batch, advantages, targets = batch_info
                     print("Minibatch shapes:")
                     print(f"traj_batch: {jax.tree_map(lambda x: x.shape, traj_batch)}")
@@ -657,6 +706,22 @@ def make_train(config):
                     print(f"targets: {targets.shape}")
 
                     def _loss_fn(params, traj_batch, gae, targets):
+                        """Calculate loss for a single agent.
+                        
+                        This function computes the loss for a single agent, which is used
+                        to update the policy and value functions.
+                        
+                        Args:
+                            params: Network parameters for the agent
+                            traj_batch: Trajectory batch containing transitions
+                            gae: Generalized Advantage Estimation (GAE) for the trajectory
+                            targets: Target values (advantages + value estimates) for the trajectory
+                        
+                        Returns:
+                            Tuple containing:
+                                - Total loss for the agent
+                                - Auxiliary loss information (value loss, actor loss, entropy)
+                        """
                         print("\nCalculating losses...")
                         # RERUN NETWORK
                         pi, value = network.apply(params, traj_batch.obs)
@@ -700,6 +765,20 @@ def make_train(config):
                             - config["ENT_COEF"] * entropy
                         )
                         print(f"Total loss: {total_loss}")
+                        
+                        loss_info = {
+                            'value_loss': value_loss,
+                            'actor_loss': loss_actor,
+                            'entropy': entropy,
+                            'total_loss': total_loss,
+                            'grad_norm': None  # Will be filled later
+                        }
+
+                        print(f"\nLoss breakdown:")
+                        for k, v in loss_info.items():
+                            if v is not None:
+                                print(f"{k}: {v}")
+
                         return total_loss, (value_loss, loss_actor, entropy)
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
@@ -713,25 +792,35 @@ def make_train(config):
 
                 train_state, traj_batch, advantages, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
+                # Calculate batch size
                 batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
                 assert (
                     batch_size == config["NUM_STEPS"] * config["NUM_ACTORS"]
                 ), "batch size must be equal to number of steps * number of actors"
+                
+                # Create permutation for shuffling
                 permutation = jax.random.permutation(_rng, batch_size)
                 batch = (traj_batch, advantages, targets)
+
                 print("\nBatch processing:")
                 print("batch_size:", batch_size)
                 print("Original batch structure:", jax.tree_map(lambda x: x.shape, batch))
+                
+                # Reshape batch to match minibatch size
                 batch = jax.tree_map(
                     lambda x: (print(f"Reshaping {x.shape} to {(batch_size,) + x.shape[2:]}"), 
                             x.reshape((batch_size,) + x.shape[2:]))[1],
                     batch
                 )
                 print("Reshaped batch structure:", jax.tree_map(lambda x: x.shape, batch))
+                
+                # Shuffle batch
                 shuffled_batch = jax.tree.map(
                     lambda x: jnp.take(x, permutation, axis=0), batch
                 )
                 print("Shuffled batch structure:", jax.tree_map(lambda x: x.shape, shuffled_batch))
+                
+                # Create minibatches
                 minibatches = jax.tree.map(
                     lambda x: jnp.reshape(
                         x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
@@ -739,12 +828,15 @@ def make_train(config):
                     shuffled_batch,
                 )
                 print("Minibatches structure:", jax.tree_map(lambda x: x.shape, minibatches))
+                
+                # Update network parameters using minibatches
                 train_state, total_loss = jax.lax.scan(
                     _update_minbatch, train_state, minibatches
                 )
                 update_state = (train_state, traj_batch, advantages, targets, rng)
                 return update_state, total_loss
 
+            # Perform a complete training epoch
             update_state = (train_state, traj_batch, advantages, targets, rng)
             update_state, loss_info = jax.lax.scan(
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
@@ -758,6 +850,14 @@ def make_train(config):
             rng = update_state[-1]
 
             def callback(metric):
+                """Log training metrics to wandb.
+                
+                This function logs the training metrics to wandb, which are used for
+                monitoring and analysis during training.
+
+                Args:
+                    metric: Training metrics to be logged
+                """
                 wandb.log(
                     metric
                 )
@@ -783,11 +883,49 @@ def make_train(config):
 
 @hydra.main(version_base=None, config_path="config", config_name="ippo_ff_overcooked_oracle")
 def main(config):
-    """Main entry point for training"""
+    """Main entry point for training
+    
+    Args:
+        config: Hydra configuration object containing training parameters
+        
+    Returns:
+        Training results and metrics
+    
+    Raises:
+        ValueError: If the environment dimensions are invalid
+    """
+    # Validate config
+    required_keys = ["ENV_NAME", "ENV_KWARGS"]
+    for key in required_keys:
+        if key not in config:
+            raise ValueError(f"Missing required config key: {key}")
+
     # Process config
     config = OmegaConf.to_container(config) 
     layout_name = config["ENV_KWARGS"]["layout"]
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
+
+    # Create environment using JaxMARL framework
+    env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+
+    # Get environment dimensions
+    base_obs_shape = env.observation_space().shape
+    base_obs_dim = int(np.prod(base_obs_shape))
+    action_dim = int(env.action_space().n)
+    augmented_obs_dim = base_obs_dim + action_dim
+
+    # Validate dimensions
+    assert base_obs_dim > 0, f"Invalid base observation dimension: {base_obs_dim}"
+    assert action_dim > 0, f"Invalid action dimension: {action_dim}"
+    assert augmented_obs_dim > base_obs_dim, "Augmented dim must be larger than base dim"
+
+    # Store dimensions in config for easy access
+    config["DIMS"] = {
+        "base_obs_shape": base_obs_shape,
+        "base_obs_dim": base_obs_dim,
+        "action_dim": action_dim,
+        "augmented_obs_dim": augmented_obs_dim
+    }
 
     # Initialize wandb logging
     wandb.init(
@@ -804,6 +942,16 @@ def main(config):
     rngs = jax.random.split(rng, config["NUM_SEEDS"])    
     train_jit = jax.jit(make_train(config))
     out = jax.vmap(train_jit)(rngs)
+
+    print("\nVerifying config before rollout:")
+    print("Config keys:", config.keys())
+    if "DIMS" in config:
+        print("Found dimensions:")
+        for key, value in config["DIMS"].items():
+            print(f"  {key}: {value}")
+    else:
+        raise ValueError("DIMS not found in config - check dimension initialization")
+
 
     # Generate visualization
     filename = f'{config["ENV_NAME"]}_{layout_name}'
