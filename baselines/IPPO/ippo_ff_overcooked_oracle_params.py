@@ -442,9 +442,52 @@ def make_train(config):
         # - calculating advantages in _calculate_gae
         # - updating the network in _update_epoch
         def _update_step(runner_state, unused):
+            """Executes a single training update step in the IPPO algorithm.
+            
+            This function performs one complete update iteration including:
+            1. Collecting trajectories by running the current policy in the environment
+            2. Computing advantages and returns
+            3. Updating the neural network using PPO
+            
+            Args:
+                runner_state: Tuple containing:
+                    - train_state: Current training state with network parameters
+                    - env_state: Current environment state
+                    - last_obs: Previous observations from environment
+                    - update_step: Current training iteration number
+                    - rng: Random number generator state
+                unused: Placeholder parameter for JAX scan compatibility
+                
+            Returns:
+                Tuple containing:
+                    - Updated runner_state
+                    - Metrics dictionary with training statistics
+            """
             # COLLECT TRAJECTORIES
             # This function handle single environment step and collets transitions
             def _env_step(runner_state, unused):
+                """Collects trajectories by running the current policy in the environment.
+                
+                This function performs one step of environment interaction for each agent,
+                collecting trajectories for training.
+
+                Args:
+                    runner_state: Tuple containing:
+                        - train_state: Current training state with network parameters
+                        - env_state: Current environment state
+                        - last_obs: Previous observations from environment
+                        - update_step: Current training iteration number
+                        - rng: Random number generator state
+
+                    unused: Placeholder parameter for JAX scan compatibility
+
+                    dims: Environment dimensions
+                    
+                Returns:
+                    Tuple containing:
+                        - Updated runner_state
+                        - Trajectory batch, info, and processed observations
+                """
                 train_state, env_state, last_obs, update_step, rng = runner_state
 
                 # SELECT ACTION
