@@ -187,7 +187,7 @@ def get_rollout(train_state, config):
     key, key_r, key_a = jax.random.split(key, 3)
 
     # Initialize observation
-    init_x = jnp.zeros(env_dims["augmented_obs_dim"])
+    init_x = jnp.zeros(dims["augmented_obs_dim"])
     init_x = init_x.flatten()
     print("Augmented init_x shape:", init_x.shape)
 
@@ -245,19 +245,39 @@ def get_rollout(train_state, config):
 
     return state_seq
 
-def batchify(x: dict, agent_list, num_actors):
-    """Convert dict of agent observations to batched array"""
-    x = jnp.stack([x[a] for a in agent_list])
-    return x.reshape((num_actors, -1))
-
-
-def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
-    """Convert batched array back to dict of agent observations"""
-    x = x.reshape((num_actors, num_envs, -1))
-    return {a: x[i] for i, a in enumerate(agent_list)}
-
 def make_train(config):
-    """Creates the main training function with the given config"""
+     """Creates the main training function for IPPO with the given configuration.
+    
+    This function sets up the training environment, networks, and optimization process
+    for training multiple agents using Independent PPO (IPPO). It handles:
+    - Environment initialization and wrapping
+    - Network architecture setup for both agents
+    - Learning rate scheduling and reward shaping annealing
+    - Training loop configuration including batch sizes and update schedules
+    
+    Args:
+        config: Dictionary containing training hyperparameters and environment settings
+               including:
+               - DIMS: Environment dimensions
+               - ENV_NAME: Name of environment to train in
+               - ENV_KWARGS: Environment configuration parameters
+               - NUM_ENVS: Number of parallel environments
+               - NUM_STEPS: Number of steps per training iteration
+               - TOTAL_TIMESTEPS: Total environment steps to train for
+               - Learning rates, batch sizes, and other optimization parameters
+               
+    Returns:
+        train: The main training function that takes an RNG key and executes the full
+               training loop, returning the trained agent policies
+    """
+    # Initialize environment
+    dims = config["DIMS"]
+    env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+
+    # Verify dimensions match what we validated in main
+    assert np.prod(env.observation_space().shape) == dims["base_obs_dim"], "Observation dimension mismatch"
+    assert env.action_space().n == dims["action_dim"], "Action dimension mismatch"
+
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env_dims = {
@@ -267,14 +287,34 @@ def make_train(config):
         "augmented_obs_dim": np.prod(env.observation_space().shape) + env.action_space().n
     }
 
+    # Revised and checked this section specifically 
+    # as it might be where the dimension mismatch originates
+
     # Calculate key training parameters
+    # The number of actors is the number of agents times the number of environments
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
+
+    # The number of updates is the total number of timesteps divided by the number of steps per update
+    # divided by the number of environments
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"] 
     )
+
+    # The minibatch size is the number of actors times the number of steps per update
+    # divided by the number of minibatches
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+
+    # Configuration printing
+    print("Initializing training with config:")
+    print(f"NUM_ENVS: {config['NUM_ENVS']}")
+    print(f"NUM_STEPS: {config['NUM_STEPS']}")
+    print(f"NUM_UPDATES: {config['NUM_UPDATES']}")
+    print(f"NUM_MINIBATCHES: {config['NUM_MINIBATCHES']}")
+    print(f"TOTAL_TIMESTEPS: {config['TOTAL_TIMESTEPS']}")
+    print(f"ENV_NAME: {config['ENV_NAME']}")
+    print(f"DIMS: {config['DIMS']}")
     
     env = LogWrapper(env, replace_info=False)
     
@@ -283,7 +323,19 @@ def make_train(config):
     # if the learning rate is too high, the model can diverge.
     # By making the learning rate decay linearly, we can ensure that the model can converge.
     def linear_schedule(count):
-        """Learning rate annealing schedule"""
+        """Linear learning rate annealing schedule that decays over training.
+        
+        Calculates a learning rate multiplier that decreases linearly from 1.0 to 0.0
+        over the course of training. Used to gradually reduce the learning rate to help
+        convergence.
+        
+        Args:
+            count: Current training step count used to calculate progress through training
+        
+        Returns:
+            float: The current learning rate after applying the annealing schedule,
+                  calculated as: base_lr * (1 - training_progress)
+        """
         frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
         return config["LR"] * frac
     
@@ -298,27 +350,81 @@ def make_train(config):
     # This is the main training loop where the training starts.
     # It initializes network with: correct number of parameters, optimizer, and learning rate annealing.
     def train(rng):
-        """Main training loop"""
-        # Initialize network and optimizer
-        network = ActorCritic(env_dims["action_dim"], activation=config["ACTIVATION"])
+        """Main training loop for Independent PPO (IPPO) algorithm.
+        
+        Implements the core training loop for training multiple agents using IPPO.
+        Handles network initialization, environment setup, and training iteration.
+        
+        Args:
+            rng: JAX random number generator key for reproducibility
+            
+        Returns:
+            Tuple containing:
+            - Final trained network parameters for both agents
+            - Training metrics and statistics
+            - Environment states from training
+            
+        The training process:
+        1. Initializes one policy network for parameter sharing
+        2. Collects experience in parallel environments
+        3. Updates policies using PPO with one shared value function
+        4. Tracks and logs training metrics
+        """
+        # Shapes we're initializing with
+        print("Action space:", env.action_space().n)
+        print("Observation space shape:", env.observation_space().shape)
+
+        # Initialize network with fixed action dimension
+        network = ActorCritic(
+            action_dim=dims["action_dim"],  # Use dimension from config
+            activation=config["ACTIVATION"]
+        )
+        
+        # Initialize seeds
         rng, _rng = jax.random.split(rng)
 
         # Initialize observation
-        init_x = jnp.zeros(env_dims["augmented_obs_dim"])
+        init_x = jnp.zeros(dims["augmented_obs_dim"])
         
         init_x = init_x.flatten()
         print("Augmented init_x shape:", init_x.shape)
         
         network_params = network.init(_rng, init_x)
         
-        # Setup optimizer with optional learning rate annealing
-        if config["ANNEAL_LR"]:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
-            )
-        else:
-            tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["LR"], eps=1e-5))
+        def create_optimizer(config):
+            """Creates an optimizer chain for training each agent's neural network.
+            
+            The optimizer chain consists of:
+            1. Gradient clipping using global norm
+            2. Adam optimizer with either:
+            - Annealed learning rate that decays linearly over training
+            - Fixed learning rate specified in config
+            
+            Args:
+                config: Dictionary containing optimization parameters like:
+                    - ANNEAL_LR: Whether to use learning rate annealing
+                    - MAX_GRAD_NORM: Maximum gradient norm for clipping
+                    - LR: Base learning rate
+                    
+            Returns:
+                optax.GradientTransformation: The composed optimizer chain
+            """
+            if config["ANNEAL_LR"]:
+                tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),  # First transformation
+                    optax.adam(learning_rate=linear_schedule, eps=1e-5)  # Second transformation
+                )
+            else:
+                tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                    optax.adam(config["LR"], eps=1e-5)
+                )
+            return tx
+
+        # Create separate optimizer chains for each agent
+        tx = create_optimizer(config)
+
+        # Create separate train states
         train_state = TrainState.create(
             apply_fn=network.apply,
             params=network_params,

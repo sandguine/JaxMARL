@@ -253,6 +253,7 @@ def get_rollout(train_state, config):
 
     return state_seq
 
+# Unused functions since we are handling batching manually
 # def batchify(x: dict, agent_list, num_actors):
 #     """Batchify observations for a single agent.
     
