@@ -185,7 +185,7 @@ def get_rollout(train_state, config):
     # Initialize seeds
     key = jax.random.PRNGKey(0)
     key, key_a, key_r = jax.random.split(key, 3)
-    # Split key_a for agent_1/agent_0 network init
+    # Split key_a for agent_1/agents_0 network init
     key_a_agent_0, key_a_agent_1 = jax.random.split(key_a)
     # key_r for environment reset
     # key for future episode steps

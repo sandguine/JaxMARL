@@ -153,13 +153,36 @@ def get_rollout(train_state, config):
     Returns:
         Episode trajectory data including states, rewards, and shaped rewards
     """
+    if "DIMS" not in config:
+        raise ValueError("Config is missing DIMS dictionary. Check that dimensions were properly initialized in main()")
+    
+    # Unpack dimensions from config at the start of the function
+    dims = config["DIMS"]
+    
+    print("\nRollout Dimensions:")
+    print(f"Base observation shape: {dims['base_obs_shape']} -> {dims['base_obs_dim']}")
+    print(f"Action dimension: {dims['action_dim']}")
+    print(f"Augmented observation dim: {dims['augmented_obs_dim']}\n")
+
     # Initialize environment
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     # env_params = env.default_params
     # env = LogWrapper(env)
 
+    # Verify dimensions match configuration
+    assert np.prod(env.observation_space().shape) == dims["base_obs_dim"], \
+        "Observation dimension mismatch in rollout"
+    assert env.action_space().n == dims["action_dim"], \
+        "Action dimension mismatch in rollout"
+
+
     # Initialize network
-    network = ActorCritic(env_dims["action_dim"], activation=config["ACTIVATION"])
+    network = ActorCritic(
+        action_dim=env_dims["action_dim"], 
+        activation=config["ACTIVATION"]
+    )
+
+    # Initialize seeds
     key = jax.random.PRNGKey(0)
     key, key_r, key_a = jax.random.split(key, 3)
 
