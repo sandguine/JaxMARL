@@ -191,7 +191,7 @@ def get_rollout(train_state, config):
     # key for future episode steps
     
     # Initialize networks with correct dimensions from config
-    init_x_agent_0 = jnp.zeros(dims["augmented_obs_dim"])  # Agent 0 gets augmented obs
+    init_x_agent_0 = jnp.zeros(dims["base_obs_dim"])  # Agent 0 gets abase obs
     init_x_agent_1 = jnp.zeros(dims["base_obs_dim"])       # Agent 1 gets base obs
     
     network_params_agent_0 = network.init(key_a_agent_0, init_x_agent_0)
@@ -214,17 +214,8 @@ def get_rollout(train_state, config):
         pi_1, _ = network.apply(network_params_agent_1, agent_1_obs)
         action_1 = pi_1.sample(seed=key_a1)
 
-        # Then process agent_0 with augmented observation
+        # Then process agent_0 with base observation
         agent_0_obs = obs["agent_0"].flatten()
-        # Create one-hot encoding of agent_1's action
-        one_hot_action = jax.nn.one_hot(action_1, dims["action_dim"])
-        # Concatenate base observation with action encoding
-        agent_0_obs_augmented = jnp.concatenate([agent_0_obs, one_hot_action])
-        
-        # Verify dimensions
-        assert agent_0_obs_augmented.shape[-1] == dims["augmented_obs_dim"], \
-            f"Agent 0 augmented obs mismatch: expected {dims['augmented_obs_dim']}, got {agent_0_obs_augmented.shape[-1]}"
-        
         pi_0, _ = network.apply(network_params_agent_0, agent_0_obs_augmented)
         action_0 = pi_0.sample(seed=key_a0)
 
@@ -404,7 +395,7 @@ def make_train(config):
         _rng_agent_0, _rng_agent_1 = jax.random.split(_rng)  # Split for two networks
 
         # Initialize networks with correct dimensions from config
-        init_x_agent_0 = jnp.zeros(dims["augmented_obs_dim"])  # Agent 0 gets augmented obs
+        init_x_agent_0 = jnp.zeros(dims["base_obs_dim"])  # Agent 0 gets base obs
         init_x_agent_1 = jnp.zeros(dims["base_obs_dim"])       # Agent 1 gets base obs
         
         network_params_agent_0 = network.init(_rng_agent_0, init_x_agent_0)
@@ -535,15 +526,9 @@ def make_train(config):
                 # agent_0 step - augmenting observation with agent_1 action
                 print("\nAgent_0 shapes:")
                 print("Original agent_0 obs shape:", last_obs['agent_0'].shape)
-                one_hot_action = jax.nn.one_hot(agent_1_action, env.action_space().n)
                 # Flatten observation while preserving batch dimension
                 agent_0_obs = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
                 print("agent_0 obs shape:", agent_0_obs.shape)
-                agent_0_obs_augmented = jnp.concatenate([
-                    agent_0_obs,
-                    one_hot_action
-                ], axis=-1)
-                print("agent_0_obs_augmented shape:", agent_0_obs_augmented.shape)
                 agent_0_pi, agent_0_value = network.apply(train_state['agent_0'].params, agent_0_obs_augmented)
                 print("agent_0_value shape:", agent_0_value.shape)
                 agent_0_action = agent_0_pi.sample(seed=_rng_agent_0)
@@ -560,21 +545,9 @@ def make_train(config):
                 print(f"  Agent 0: {agent_0_obs.shape}")
                 print(f"  Agent 1: {agent_1_obs.shape}")
                 
-                print(f"\nAugmented obs shape:")
-                print(f"  Agent 0: {agent_0_obs_augmented.shape}")
-
-                # Add shape checks
-                print("\nDimension checks:")
-                # Correct dimension checks
-                assert agent_0_obs.shape[-1] == dims["base_obs_dim"], \
-                    f"Agent 0 base obs dimension mismatch: expected {dims['base_obs_dim']}, got {agent_0_obs.shape[-1]}"
-                assert agent_1_obs.shape[-1] == dims["base_obs_dim"], \
-                    f"Agent 1 base obs dimension mismatch: expected {dims['base_obs_dim']}, got {agent_1_obs.shape[-1]}"
-                assert agent_0_obs_augmented.shape[-1] == dims["augmented_obs_dim"], \
-                    f"Agent 0 augmented obs dimension mismatch: expected {dims['augmented_obs_dim']}, got {agent_0_obs_augmented.shape[-1]}"
 
                 processed_obs = {
-                    'agent_0': agent_0_obs_augmented,
+                    'agent_0': agent_0_obs,
                     'agent_1': agent_1_obs
                 }
                 print("\nProcessed obs shapes:")
@@ -641,10 +614,8 @@ def make_train(config):
             print("agent_1_last_val shape:", agent_1_last_val.shape)
 
             # For agent_0, need to include agent_1's last action in observation
-            one_hot_last_action = jax.nn.one_hot(traj_batch.action[-1, 1], env.action_space().n)
             last_obs_agent0 = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
-            last_obs_agent0_augmented = jnp.concatenate([last_obs_agent0, one_hot_last_action], axis=-1)
-            _, agent_0_last_val = network.apply(train_state['agent_0'].params, last_obs_agent0_augmented)
+            _, agent_0_last_val = network.apply(train_state['agent_0'].params, last_obs_agent0)
             print("agent_0_last_val shape:", agent_0_last_val.shape)
 
             # Combine values for advantage calculation
@@ -1142,7 +1113,7 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "FF", "Oracle"],
+        tags=["IPPO", "FF", "Oracle", "Split"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f'ippo_ff_overcooked_{layout_name}'
