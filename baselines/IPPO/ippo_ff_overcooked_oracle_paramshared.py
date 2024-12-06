@@ -770,71 +770,40 @@ def make_train(config):
                                 - Total loss
                                 - Tuple of individual loss components
                         """
-                        # Get batch size from the observation shapes
-                        # Debug shapes show obs is a dict with shape (512, 526) for each agent
-                        batch_size = traj_batch.obs['agent_0'].shape[0]
-                        
-                        # Process each agent separately using shared parameters
-                        # Agent 1 (gets zero action vector in obs from wrapper)
-                        pi1, value1 = network.apply(params, traj_batch.obs['agent_1'])
-                        log_prob1 = pi1.log_prob(traj_batch.action[:, 1])  # Shape: (batch_size,)
-                        
-                        # Agent 0 (gets Agent 1's action in obs from wrapper)
+                        # Process each agent's observations separately
                         pi0, value0 = network.apply(params, traj_batch.obs['agent_0'])
-                        log_prob0 = pi0.log_prob(traj_batch.action[:, 0])  # Shape: (batch_size,)
+                        pi1, value1 = network.apply(params, traj_batch.obs['agent_1'])
                         
-                        # Calculate value losses for both agents
-                        value_pred_clipped0 = traj_batch.value[:, 0] + (
-                            value0 - traj_batch.value[:, 0]
+                        # Stack outputs to match original format
+                        pi_stacked = jnp.stack([pi0, pi1])
+                        value_stacked = jnp.stack([value0, value1])
+                        
+                        # Calculate losses exactly as in original implementation
+                        log_prob = pi_stacked.log_prob(traj_batch.action)
+                        
+                        # Value loss (unchanged from original)
+                        value_pred_clipped = traj_batch.value + (
+                            value_stacked - traj_batch.value
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+                        value_losses = jnp.square(value_stacked - targets)
+                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
+                        value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                         
-                        value_pred_clipped1 = traj_batch.value[:, 1] + (
-                            value1 - traj_batch.value[:, 1]
-                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                        
-                        value_losses0 = jnp.square(value0 - targets[:, 0])
-                        value_losses1 = jnp.square(value1 - targets[:, 1])
-                        value_losses_clipped0 = jnp.square(value_pred_clipped0 - targets[:, 0])
-                        value_losses_clipped1 = jnp.square(value_pred_clipped1 - targets[:, 1])
-                        
-                        value_loss = 0.5 * (
-                            jnp.maximum(value_losses0, value_losses_clipped0).mean() +
-                            jnp.maximum(value_losses1, value_losses_clipped1).mean()
-                        )
-                        
-                        # Calculate actor losses for both agents
-                        ratio0 = jnp.exp(log_prob0 - traj_batch.log_prob[:, 0])
-                        ratio1 = jnp.exp(log_prob1 - traj_batch.log_prob[:, 1])
-                        
-                        # Normalize advantages separately for each agent
-                        gae0 = (gae[:, 0] - gae[:, 0].mean()) / (gae[:, 0].std() + 1e-8)
-                        gae1 = (gae[:, 1] - gae[:, 1].mean()) / (gae[:, 1].std() + 1e-8)
-                        
-                        # Calculate clipped losses
-                        loss_actor0_1 = ratio0 * gae0
-                        loss_actor0_2 = jnp.clip(
-                            ratio0,
+                        # Actor loss (unchanged from original)
+                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        loss_actor1 = ratio * gae
+                        loss_actor2 = jnp.clip(
+                            ratio,
                             1.0 - config["CLIP_EPS"],
                             1.0 + config["CLIP_EPS"]
-                        ) * gae0
+                        ) * gae
+                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2).mean()
                         
-                        loss_actor1_1 = ratio1 * gae1
-                        loss_actor1_2 = jnp.clip(
-                            ratio1,
-                            1.0 - config["CLIP_EPS"],
-                            1.0 + config["CLIP_EPS"]
-                        ) * gae1
-                        
-                        # Combine actor losses
-                        loss_actor = -(
-                            jnp.minimum(loss_actor0_1, loss_actor0_2).mean() +
-                            jnp.minimum(loss_actor1_1, loss_actor1_2).mean()
-                        ) / 2
-                        
-                        # Calculate entropy (average of both agents)
+                        # Calculate entropy (unchanged from original)
                         entropy = (pi0.entropy().mean() + pi1.entropy().mean()) / 2
                         
-                        # Combine all losses
+                        # Combine losses (unchanged from original)
                         total_loss = (
                             loss_actor +
                             config["VF_COEF"] * value_loss -
