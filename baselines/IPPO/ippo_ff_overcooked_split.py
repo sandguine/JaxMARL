@@ -216,7 +216,7 @@ def get_rollout(train_state, config):
 
         # Then process agent_0 with base observation
         agent_0_obs = obs["agent_0"].flatten()
-        pi_0, _ = network.apply(network_params_agent_0, agent_0_obs_augmented)
+        pi_0, _ = network.apply(network_params_agent_0, agent_0_obs)
         action_0 = pi_0.sample(seed=key_a0)
 
         actions = {
@@ -529,7 +529,7 @@ def make_train(config):
                 # Flatten observation while preserving batch dimension
                 agent_0_obs = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
                 print("agent_0 obs shape:", agent_0_obs.shape)
-                agent_0_pi, agent_0_value = network.apply(train_state['agent_0'].params, agent_0_obs_augmented)
+                agent_0_pi, agent_0_value = network.apply(train_state['agent_0'].params, agent_0_obs)
                 print("agent_0_value shape:", agent_0_value.shape)
                 agent_0_action = agent_0_pi.sample(seed=_rng_agent_0)
                 print("agent_0_action_shape:", agent_0_action.shape)
@@ -1113,7 +1113,7 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "FF", "Oracle", "Split"],
+        tags=["IPPO", "FF", "Oracle", "Split", "Baseline"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f'ippo_ff_overcooked_{layout_name}'

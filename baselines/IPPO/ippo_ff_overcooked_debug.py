@@ -563,7 +563,7 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "FF", "Debug", "Oracle"],
+        tags=["IPPO", "FF", "Debug", "Oracle", "Baseline", "ParamShared"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f'ippo_ff_overcooked_{layout_name}'
@@ -576,7 +576,7 @@ def main(config):
     out = jax.vmap(train_jit)(rngs)
 
     # Generate visualization
-    filename = f'{config["ENV_NAME"]}_{layout_name}'
+    filename = f'{config["ENV_NAME"]}_{layout_name}_{"baseline"}'
     train_state = jax.tree.map(lambda x: x[0], out["runner_state"][0])
     state_seq = get_rollout(train_state, config)
     viz = OvercookedVisualizer()

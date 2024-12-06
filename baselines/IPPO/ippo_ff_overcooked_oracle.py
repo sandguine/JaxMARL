@@ -194,8 +194,8 @@ def get_rollout(train_state, config):
     init_x_agent_0 = jnp.zeros(dims["augmented_obs_dim"])  # Agent 0 gets augmented obs
     init_x_agent_1 = jnp.zeros(dims["base_obs_dim"])       # Agent 1 gets base obs
     
-    network_params_agent_0 = network.init(key_a_agent_0, init_x_agent_0)
-    network_params_agent_1 = network.init(key_a_agent_1, init_x_agent_1)
+    network_params_agent_0 = train_state['agent_0'].params
+    network_params_agent_1 = train_state['agent_1'].params
 
     done = False
 
@@ -1164,7 +1164,7 @@ def main(config):
         raise ValueError("DIMS not found in config - check dimension initialization")
 
     # Generate visualization
-    filename = f'{config["ENV_NAME"]}_{layout_name}'
+    filename = f'{config["ENV_NAME"]}_{layout_name}_{"oracle"}'
     train_state = jax.tree.map(lambda x: x[0], out["runner_state"][0])
     state_seq = get_rollout(train_state, config)
     viz = OvercookedVisualizer()
