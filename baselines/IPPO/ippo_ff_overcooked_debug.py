@@ -421,12 +421,15 @@ def make_train(config):
                     def _loss_fn(params, traj_batch, gae, targets):
                         print("\nCalculating losses...")
                         # RERUN NETWORK
+                        # Step 1: Ask our neural network what it currently thinks
                         pi, value = network.apply(params, traj_batch.obs)
                         print(f"Network outputs - pi shape: {pi.batch_shape}, value shape: {value.shape}")
+                        # Step 2: Calculate how much we trust the current action choices
                         log_prob = pi.log_prob(traj_batch.action)
                         print(f"Log prob shape: {log_prob.shape}")
 
                         # CALCULATE VALUE LOSS
+                        # Step 3: Value Loss - Learning to judge how good situations are
                         value_pred_clipped = traj_batch.value + (
                             value - traj_batch.value
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
@@ -438,8 +441,10 @@ def make_train(config):
                         print(f"Value loss: {value_loss}")
 
                         # CALCULATE ACTOR LOSS
+                        # "How much more or less likely are we to take this action now compared to before?"
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
                         print(f"Importance ratio shape: {ratio.shape}")
+                        # Step 4: Actor Loss - Learning which actions to take
                         gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         print(f"Normalized GAE shape: {gae.shape}")
                         loss_actor1 = ratio * gae
@@ -453,9 +458,12 @@ def make_train(config):
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
+
+                        # Step 5: Entropy - Encouraging exploration
                         entropy = pi.entropy().mean()
                         print(f"Actor loss: {loss_actor}, Entropy: {entropy}")
 
+                        # Final mix of all components
                         total_loss = (
                             loss_actor
                             + config["VF_COEF"] * value_loss

@@ -575,11 +575,11 @@ def make_train(config):
 
                 # Create transition object with consistent ordering
                 transition = Transition(
-                    done=jnp.array([done["agent_1"], done["agent_0"]]).squeeze(),
-                    action=jnp.array([action_1, action_0]),
-                    value=jnp.array([value_1, value_0]),
-                    reward=jnp.array([reward["agent_1"], reward["agent_0"]]).squeeze(),
-                    log_prob=jnp.array([log_prob_1, log_prob_0]),
+                    done=jnp.array([done["agent_0"], done["agent_1"]]).squeeze(),
+                    action=jnp.array([action_0, action_1]),
+                    value=jnp.array([value_0, value_1]),
+                    reward=jnp.array([reward["agent_0"], reward["agent_1"]]).squeeze(),
+                    log_prob=jnp.array([log_prob_0, log_prob_1]),
                     obs=processed_obs
                 )
                 runner_state = (train_state, env_state, obsv, update_step, rng)
