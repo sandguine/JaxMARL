@@ -488,6 +488,17 @@ def make_train(config):
                     'agent_1': last_obs['agent_1'].reshape(config["NUM_ENVS"], -1),   # Shape: (NUM_ENVS, base_obs_dim)
                 }
 
+                # Store raw observations and actions separately
+                raw_obs = {
+                    'agent_0': last_obs['agent_0'].reshape(-1),
+                    'agent_1': last_obs['agent_1'].reshape(-1)
+                }
+                # Store the actual actions taken for proper reconstruction
+                stored_actions = {
+                    'agent_0': None,  # Will be filled
+                    'agent_1': None   # Will be filled
+                }
+
                 # Create zero action vector with proper batch dimension
                 zero_action = jnp.zeros((config["NUM_ENVS"], env.action_space().n))  # Shape: (NUM_ENVS, action_dim)
                 
@@ -500,6 +511,7 @@ def make_train(config):
                 # Get agent_1's action first using shared parameters
                 pi_1, value_1 = network.apply(train_state.params, obs_batch['agent_1'])
                 action_1 = pi_1.sample(seed=_rng)
+                stored_actions['agent_1'] = action_1
                 
                 # Augment agent_0's observation with agent_1's action
                 one_hot_action = jax.nn.one_hot(action_1, env.action_space().n)  # Shape: (NUM_ENVS, action_dim)
@@ -511,6 +523,7 @@ def make_train(config):
                 # Get agent_0's action using shared parameters
                 pi_0, value_0 = network.apply(train_state.params, obs_batch['agent_0'])
                 action_0 = pi_0.sample(seed=_rng)
+                stored_actions['agent_0'] = action_0
 
                 # Package actions and step environment
                 env_act = {
@@ -547,11 +560,11 @@ def make_train(config):
                 # Create transition object with consistent ordering
                 transition = Transition(
                     done=jnp.array([done["agent_0"], done["agent_1"]]).squeeze(),
-                    action=jnp.array([action_0, action_1]),  # Using consistent variable names
+                    action=stored_actions,
                     value=jnp.array([value_0, value_1]),
                     reward=jnp.array([reward["agent_0"], reward["agent_1"]]).squeeze(),
                     log_prob=jnp.array([pi_0.log_prob(action_0), pi_1.log_prob(action_1)]),
-                    obs=obs_batch
+                    obs=raw_obs
                 )
 
                 runner_state = (train_state, env_state, obsv, update_step, rng)
@@ -745,21 +758,21 @@ def make_train(config):
                         # First process Agent 1 (acts without information)
                         agent_1_obs = traj_batch.obs['agent_1'][..., :-env.action_space().n]  # Remove action part
                         zero_actions = jnp.zeros_like(traj_batch.obs['agent_1'][..., -env.action_space().n:])
-                        agent_1_obs_augmented = jnp.concatenate([agent_1_obs, zero_actions], axis=-1)
+                        agent_1_obs_augmented = jnp.concatenate([traj_batch.obs['agent_1'], zero_actions], axis=-1)
                         pi1, value1 = network.apply(params, agent_1_obs_augmented)
                         
                         # Then process Agent 0 (acts with Agent 1's action info)
                         agent_0_obs = traj_batch.obs['agent_0'][..., :-env.action_space().n]  # Remove action part
                         agent_1_actions = traj_batch.action[..., 0]  # Get Agent 1's actions
                         one_hot_actions = jax.nn.one_hot(agent_1_actions, env.action_space().n)
-                        agent_0_obs_augmented = jnp.concatenate([agent_0_obs, one_hot_actions], axis=-1)
+                        agent_0_obs_augmented = jnp.concatenate([traj_batch.obs['agent_0'], one_hot_actions], axis=-1)
                         pi0, value0 = network.apply(params, agent_0_obs_augmented)
                         
                         # Rest of PPO remains nearly identical
-                        values = jnp.stack([value1, value0], axis=1)
+                        values = jnp.stack([value0, value1], axis=1)
                         log_probs = jnp.stack([
-                            pi1.log_prob(traj_batch.action[..., 0]),
-                            pi0.log_prob(traj_batch.action[..., 1])
+                            pi0.log_prob(traj_batch.action[..., 1]),
+                            pi1.log_prob(traj_batch.action[..., 0])
                         ], axis=1)
                         
                         # Standard PPO losses remain the same
