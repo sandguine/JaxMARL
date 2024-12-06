@@ -239,6 +239,17 @@ def get_rollout(train_state, config):
 
     return state_seq
 
+def batchify(x: dict, agent_list, num_actors):
+    """Convert dict of agent observations to batched array"""
+    x = jnp.stack([x[a] for a in agent_list])
+    return x.reshape((num_actors, -1))
+
+
+def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
+    """Convert batched array back to dict of agent observations"""
+    x = x.reshape((num_actors, num_envs, -1))
+    return {a: x[i] for i, a in enumerate(agent_list)}
+
 def make_train(config):
     """Creates the main training function for IPPO with the given configuration.
     
