@@ -121,7 +121,6 @@ class ActorCritic(nn.Module):
 
         return pi, jnp.squeeze(critic, axis=-1)
     
-
 class Transition(NamedTuple):
     """Container for storing experience transitions
 
@@ -174,7 +173,6 @@ def get_rollout(train_state, config):
         "Observation dimension mismatch in rollout"
     assert env.action_space().n == dims["action_dim"], \
         "Action dimension mismatch in rollout"
-
 
     # Initialize network
     network = ActorCritic(
@@ -278,30 +276,11 @@ def make_train(config):
     assert np.prod(env.observation_space().shape) == dims["base_obs_dim"], "Observation dimension mismatch"
     assert env.action_space().n == dims["action_dim"], "Action dimension mismatch"
 
-    # Initialize environment
-    env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
-    env_dims = {
-        "base_obs_shape": env.observation_space().shape,
-        "base_obs_dim": np.prod(env.observation_space().shape),
-        "action_dim": env.action_space().n,
-        "augmented_obs_dim": np.prod(env.observation_space().shape) + env.action_space().n
-    }
-
-    # Revised and checked this section specifically 
-    # as it might be where the dimension mismatch originates
-
     # Calculate key training parameters
-    # The number of actors is the number of agents times the number of environments
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
-
-    # The number of updates is the total number of timesteps divided by the number of steps per update
-    # divided by the number of environments
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"] 
     )
-
-    # The minibatch size is the number of actors times the number of steps per update
-    # divided by the number of minibatches
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
@@ -345,7 +324,6 @@ def make_train(config):
         end_value=0.,
         transition_steps=config["REW_SHAPING_HORIZON"]
     )
-
 
     # This is the main training loop where the training starts.
     # It initializes network with: correct number of parameters, optimizer, and learning rate annealing.
