@@ -185,7 +185,7 @@ def get_rollout(train_state, config):
     # Initialize seeds
     key = jax.random.PRNGKey(0)
     key, key_a, key_r = jax.random.split(key, 3)
-    # Split key_a for agent_1/agent_0 network init
+    # Split key_a for agent_1/agents_0 network init
     key_a_agent_0, key_a_agent_1 = jax.random.split(key_a)
     # key_r for environment reset
     # key for future episode steps
@@ -194,8 +194,8 @@ def get_rollout(train_state, config):
     init_x_agent_0 = jnp.zeros(dims["augmented_obs_dim"])  # Agent 0 gets augmented obs
     init_x_agent_1 = jnp.zeros(dims["base_obs_dim"])       # Agent 1 gets base obs
     
-    network_params_agent_0 = network.init(key_a_agent_0, init_x_agent_0)
-    network_params_agent_1 = network.init(key_a_agent_1, init_x_agent_1)
+    network_params_agent_0 = train_state['agent_0'].params
+    network_params_agent_1 = train_state['agent_1'].params
 
     done = False
 
@@ -253,40 +253,41 @@ def get_rollout(train_state, config):
 
     return state_seq
 
-def batchify(x: dict, agent_list, num_actors):
-    """Batchify observations for a single agent.
+# Unused functions since we are handling batching manually
+# def batchify(x: dict, agent_list, num_actors):
+#     """Batchify observations for a single agent.
     
-    This function stacks the observations for a single agent across multiple environments,
-    reshaping them into a single array with shape (num_actors, -1).
+#     This function stacks the observations for a single agent across multiple environments,
+#     reshaping them into a single array with shape (num_actors, -1).
 
-    Args:
-        x: Dictionary containing observations for a single agent
-        agent_list: List of agent names
-        num_actors: Number of parallel environments
+#     Args:
+#         x: Dictionary containing observations for a single agent
+#         agent_list: List of agent names
+#         num_actors: Number of parallel environments
 
-    Returns:
-        Batched observations with shape (num_actors, -1)
-    """
-    x = jnp.stack([x[a] for a in agent_list])
-    return x.reshape((num_actors, -1))
+#     Returns:
+#         Batched observations with shape (num_actors, -1)
+#     """
+#     x = jnp.stack([x[a] for a in agent_list])
+#     return x.reshape((num_actors, -1))
 
-def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
-    """Convert batched array back to dict of agent observations.
+# def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
+#     """Convert batched array back to dict of agent observations.
     
-    This function reshapes the batched array back to a dictionary of observations for
-    each agent, with shape (num_envs, -1).
+#     This function reshapes the batched array back to a dictionary of observations for
+#     each agent, with shape (num_envs, -1).
 
-    Args:
-        x: Batched observations with shape (num_actors, num_envs, -1)
-        agent_list: List of agent names
-        num_envs: Number of parallel environments
-        num_actors: Number of actors (agents)
+#     Args:
+#         x: Batched observations with shape (num_actors, num_envs, -1)
+#         agent_list: List of agent names
+#         num_envs: Number of parallel environments
+#         num_actors: Number of actors (agents)
 
-    Returns:
-        Dictionary containing observations for each agent
-    """
-    x = x.reshape((num_actors, num_envs, -1))
-    return {a: x[i] for i, a in enumerate(agent_list)}
+#     Returns:
+#         Dictionary containing observations for each agent
+#     """
+#     x = x.reshape((num_actors, num_envs, -1))
+#     return {a: x[i] for i, a in enumerate(agent_list)}
 
 def make_train(config):
     """Creates the main training function for IPPO with the given configuration.
@@ -612,14 +613,14 @@ def make_train(config):
                 print("shaped reward:", info["shaped_reward"])
 
                 transition = Transition(
-                    done=jnp.array([done["agent_1"], done["agent_0"]]).squeeze(),
-                    action=jnp.array([agent_1_action, agent_0_action]),
-                    value=jnp.array([agent_1_value, agent_0_value]),
+                    done=jnp.array([done["agent_0"], done["agent_1"]]).squeeze(),
+                    action=jnp.array([agent_0_action, agent_1_action]),
+                    value=jnp.array([agent_0_value, agent_1_value]),
                     reward=jnp.array([
-                        reward["agent_1"],  # Agent 1's rewards
-                        reward["agent_0"]   # Agent 0's rewards
+                        reward["agent_0"],  # Agent 1's rewards
+                        reward["agent_1"]   # Agent 0's rewards
                     ]).squeeze(),
-                    log_prob=jnp.array([agent_1_log_prob, agent_0_log_prob]),
+                    log_prob=jnp.array([agent_0_log_prob, agent_1_log_prob]),
                     obs=processed_obs
                 )
 
@@ -647,7 +648,7 @@ def make_train(config):
             print("agent_0_last_val shape:", agent_0_last_val.shape)
 
             # Combine values for advantage calculation
-            last_val = jnp.array([agent_1_last_val, agent_0_last_val])
+            last_val = jnp.array([agent_0_last_val, agent_1_last_val])
             print("stacked last_val shape:", last_val.shape)
 
             # calculate_gae itself didn't need to be changed because we can use the same advantage function for both agents
@@ -1163,7 +1164,7 @@ def main(config):
         raise ValueError("DIMS not found in config - check dimension initialization")
 
     # Generate visualization
-    filename = f'{config["ENV_NAME"]}_{layout_name}'
+    filename = f'{config["ENV_NAME"]}_{layout_name}_{"oracle"}'
     train_state = jax.tree.map(lambda x: x[0], out["runner_state"][0])
     state_seq = get_rollout(train_state, config)
     viz = OvercookedVisualizer()
