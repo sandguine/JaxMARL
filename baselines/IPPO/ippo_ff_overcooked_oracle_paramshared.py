@@ -447,11 +447,13 @@ def make_train(config):
             def _env_step(runner_state, unused):
                 """Collects trajectories by running the current policy in the environment.
     
-                This function implements a sequential decision process where both agents use the same
-                neural network parameters but receive different observations. Agent 1 receives its
-                observation augmented with a zero action vector, while Agent 0 receives its observation
-                augmented with Agent 1's actual action. This creates an asymmetric information structure
-                while maintaining parameter sharing benefits.
+                This implementation maintains a clear sequence:
+                1. Process Agent 1 first with base observation + zero action
+                2. Use Agent 1's action to process Agent 0's observation
+                3. Both agents use the same network parameters and RNG key
+                
+                The key insight is that even with shared parameters and RNG, the agents will behave
+                differently because they receive different observations.
                 
                 Args:
                     runner_state: Tuple containing training state elements
@@ -466,72 +468,62 @@ def make_train(config):
                 """
                 train_state, env_state, last_obs, update_step, rng = runner_state
 
-                # SELECT ACTION
+                # Split RNG once for all operations in this step
                 rng, _rng = jax.random.split(rng)
 
-                # Debug original observation shapes
-                print("\nInitial observation shapes:")
-                print(f"agent_0 original shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_0'])}")
-                print(f"agent_1 original shape: {jax.tree_map(lambda x: x.shape, last_obs['agent_1'])}")
-
-                # Reshape observations while preserving batch dimension
-                agent_0_obs = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
+                # Process agent_1 first with zero action vector
+                print("\nAgent_1 shapes:")
+                print("Original agent_1 obs shape:", last_obs['agent_1'].shape)
+                # Reshape while preserving batch dimension
                 agent_1_obs = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
+                print("agent_1 obs shape:", agent_1_obs.shape)
+                
+                # Create zero action vector for agent_1
+                zero_action = jnp.zeros((last_obs['agent_1'].shape[0], env.action_space().n))
+                agent_1_obs_augmented = jnp.concatenate([agent_1_obs, zero_action], axis=-1)
+                print("agent_1 augmented shape:", agent_1_obs_augmented.shape)
+                
+                # Get agent_1's action using shared parameters
+                agent_1_pi, agent_1_value = network.apply(train_state.params, agent_1_obs_augmented)
+                agent_1_action = agent_1_pi.sample(seed=_rng)  # Using same RNG key
+                agent_1_log_prob = agent_1_pi.log_prob(agent_1_action)
+                
+                print("agent_1_value shape:", agent_1_value.shape)
+                print("agent_1 action shape:", agent_1_action.shape)
+                print("agent_1 log prob shape:", agent_1_log_prob.shape)
 
-                print("\nReshaped observation shapes:")
-                print(f"agent_0 reshaped: {agent_0_obs.shape}")
-                print(f"agent_1 reshaped: {agent_1_obs.shape}")
+                # Now process agent_0 with agent_1's action
+                print("\nAgent_0 shapes:")
+                print("Original agent_0 obs shape:", last_obs['agent_0'].shape)
+                agent_0_obs = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
+                print("agent_0 obs shape:", agent_0_obs.shape)
+                
+                # Create one-hot encoding of agent_1's action
+                one_hot_action = jax.nn.one_hot(agent_1_action, env.action_space().n)
+                agent_0_obs_augmented = jnp.concatenate([agent_0_obs, one_hot_action], axis=-1)
+                print("agent_0_obs_augmented shape:", agent_0_obs_augmented.shape)
+                
+                # Get agent_0's action using shared parameters
+                agent_0_pi, agent_0_value = network.apply(train_state.params, agent_0_obs_augmented)
+                agent_0_action = agent_0_pi.sample(seed=_rng)  # Using same RNG key
+                agent_0_log_prob = agent_0_pi.log_prob(agent_0_action)
+                
+                print("agent_0_value shape:", agent_0_value.shape)
+                print("agent_0_action_shape:", agent_0_action.shape)
+                print("agent_0_log_prob_shape:", agent_0_log_prob.shape)
 
-                # Validate base observation dimensions
+                # Verify dimensions
+                print("\nDimension checks:")
                 assert agent_0_obs.shape[-1] == dims["base_obs_dim"], \
                     f"Agent 0 base obs dimension mismatch: {agent_0_obs.shape[-1]} vs expected {dims['base_obs_dim']}"
                 assert agent_1_obs.shape[-1] == dims["base_obs_dim"], \
                     f"Agent 1 base obs dimension mismatch: {agent_1_obs.shape[-1]} vs expected {dims['base_obs_dim']}"
-
-                # Create zero action vector for agent_1's initial observation
-                zero_action = jnp.zeros((last_obs['agent_1'].shape[0], env.action_space().n))
-                agent_1_obs_augmented = jnp.concatenate([agent_1_obs, zero_action], axis=-1)
-
-                print("\nAgent 1 network input:")
-                print(f"zero_action shape: {zero_action.shape}")
-                print(f"agent_1 augmented obs shape: {agent_1_obs_augmented.shape}")
-
-                # Get agent_1's action using shared parameters
-                pi_1, value_1 = network.apply(train_state.params, agent_1_obs_augmented)
-                action_1 = pi_1.sample(seed=_rng)
-                log_prob_1 = pi_1.log_prob(action_1)
-
-                print("\nAgent 1 outputs:")
-                print(f"action_1 shape: {action_1.shape}")
-                print(f"value_1 shape: {value_1.shape}")
-                print(f"log_prob_1 shape: {log_prob_1.shape}")
-
-                # Create agent_0's observation with agent_1's actual action
-                one_hot_action = jax.nn.one_hot(action_1, env.action_space().n)
-                agent_0_obs_augmented = jnp.concatenate([agent_0_obs, one_hot_action], axis=-1)
-
-                print("\nAgent 0 network input:")
-                print(f"one_hot_action shape: {one_hot_action.shape}")
-                print(f"agent_0 augmented obs shape: {agent_0_obs_augmented.shape}")
-
-                # Validate augmented observation dimensions
                 assert agent_0_obs_augmented.shape[-1] == dims["augmented_obs_dim"], \
-                    f"Agent 0 augmented dim mismatch: {agent_0_obs_augmented.shape[-1]} vs expected {dims['augmented_obs_dim']}"
+                    f"Agent 0 augmented dimension mismatch: {agent_0_obs_augmented.shape[-1]} vs expected {dims['augmented_obs_dim']}"
                 assert agent_1_obs_augmented.shape[-1] == dims["augmented_obs_dim"], \
-                    f"Agent 1 augmented dim mismatch: {agent_1_obs_augmented.shape[-1]} vs expected {dims['augmented_obs_dim']}"
+                    f"Agent 1 augmented dimension mismatch: {agent_1_obs_augmented.shape[-1]} vs expected {dims['augmented_obs_dim']}"
 
-                # Get agent_0's action using the same shared parameters
-                pi_0, value_0 = network.apply(train_state.params, agent_0_obs_augmented)
-                # Use the same RNG key since we're using shared parameters
-                action_0 = pi_0.sample(seed=_rng)
-                log_prob_0 = pi_0.log_prob(action_0)
-
-                print("\nAgent 0 outputs:")
-                print(f"action_0 shape: {action_0.shape}")
-                print(f"value_0 shape: {value_0.shape}")
-                print(f"log_prob_0 shape: {log_prob_0.shape}")
-
-                # Store processed observations for training
+                # Store processed observations
                 processed_obs = {
                     'agent_0': agent_0_obs_augmented,
                     'agent_1': agent_1_obs_augmented
@@ -539,14 +531,10 @@ def make_train(config):
 
                 # Package actions for environment step
                 env_act = {
-                    "agent_0": action_0,
-                    "agent_1": action_1
+                    "agent_0": agent_0_action,
+                    "agent_1": agent_1_action
                 }
-                
-                print("\nEnvironment action shapes:")
-                print("Before flattening:", jax.tree_map(lambda x: x.shape, env_act))
                 env_act = {k: v.flatten() for k, v in env_act.items()}
-                print("After flattening:", jax.tree_map(lambda x: x.shape, env_act))
                 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
