@@ -980,12 +980,6 @@ def main(config):
     
     # Create environment using JaxMARL framework
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
-    print("\nEnvironment Action Space Debug:")
-    print(f"Action space: {env.action_space()}")
-    print(f"Number of actions: {env.action_space().n}")
-    print(f"Action enum values:")
-    for action in Actions:
-        print(f"  {action.name}: {action.value}")
 
     # Get environment dimensions
     base_obs_shape = env.observation_space().shape
