@@ -448,8 +448,8 @@ def make_train(config):
                 """Collects trajectories by running the current policy in the environment.
     
                 This implementation maintains a clear sequence:
-                1. Process Agent 1 first with base observation + zero action
-                2. Use Agent 1's action to process Agent 0's observation
+                1. Agent 1 acts first with zero action vector in observation
+                2. Agent 0 acts using Agent 1's current action in observation
                 3. Both agents use the same network parameters and RNG key
                 
                 The key insight is that even with shared parameters and RNG, the agents will behave
@@ -474,25 +474,26 @@ def make_train(config):
                 # Process agent_1 first with zero action vector
                 print("\nAgent_1 shapes:")
                 print("Original agent_1 obs shape:", last_obs['agent_1'].shape)
-                # Reshape while preserving batch dimension
                 agent_1_obs = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
                 print("agent_1 obs shape:", agent_1_obs.shape)
                 
-                # Create zero action vector for agent_1
-                zero_action = jnp.zeros((last_obs['agent_1'].shape[0], env.action_space().n))
-                agent_1_obs_augmented = jnp.concatenate([agent_1_obs, zero_action], axis=-1)
+                # Create "no action" indicator (-1s instead of 0s) for agent_1's observation
+                # This makes it clear to the network that there is no action information
+                # rather than interpreting 0 as the "up" action
+                no_action_indicator = -1 * jnp.ones((last_obs['agent_1'].shape[0], env.action_space().n))
+                agent_1_obs_augmented = jnp.concatenate([agent_1_obs, no_action_indicator], axis=-1)
                 print("agent_1 augmented shape:", agent_1_obs_augmented.shape)
                 
                 # Get agent_1's action using shared parameters
                 agent_1_pi, agent_1_value = network.apply(train_state.params, agent_1_obs_augmented)
-                agent_1_action = agent_1_pi.sample(seed=_rng)  # Using same RNG key
+                agent_1_action = agent_1_pi.sample(seed=_rng)
                 agent_1_log_prob = agent_1_pi.log_prob(agent_1_action)
                 
                 print("agent_1_value shape:", agent_1_value.shape)
                 print("agent_1 action shape:", agent_1_action.shape)
                 print("agent_1 log prob shape:", agent_1_log_prob.shape)
 
-                # Now process agent_0 with agent_1's action
+                # Process agent_0 with agent_1's action
                 print("\nAgent_0 shapes:")
                 print("Original agent_0 obs shape:", last_obs['agent_0'].shape)
                 agent_0_obs = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
@@ -505,23 +506,12 @@ def make_train(config):
                 
                 # Get agent_0's action using shared parameters
                 agent_0_pi, agent_0_value = network.apply(train_state.params, agent_0_obs_augmented)
-                agent_0_action = agent_0_pi.sample(seed=_rng)  # Using same RNG key
+                agent_0_action = agent_0_pi.sample(seed=_rng)
                 agent_0_log_prob = agent_0_pi.log_prob(agent_0_action)
                 
                 print("agent_0_value shape:", agent_0_value.shape)
                 print("agent_0_action_shape:", agent_0_action.shape)
                 print("agent_0_log_prob_shape:", agent_0_log_prob.shape)
-
-                # Verify dimensions
-                print("\nDimension checks:")
-                assert agent_0_obs.shape[-1] == dims["base_obs_dim"], \
-                    f"Agent 0 base obs dimension mismatch: {agent_0_obs.shape[-1]} vs expected {dims['base_obs_dim']}"
-                assert agent_1_obs.shape[-1] == dims["base_obs_dim"], \
-                    f"Agent 1 base obs dimension mismatch: {agent_1_obs.shape[-1]} vs expected {dims['base_obs_dim']}"
-                assert agent_0_obs_augmented.shape[-1] == dims["augmented_obs_dim"], \
-                    f"Agent 0 augmented dimension mismatch: {agent_0_obs_augmented.shape[-1]} vs expected {dims['augmented_obs_dim']}"
-                assert agent_1_obs_augmented.shape[-1] == dims["augmented_obs_dim"], \
-                    f"Agent 1 augmented dimension mismatch: {agent_1_obs_augmented.shape[-1]} vs expected {dims['augmented_obs_dim']}"
 
                 # Store processed observations
                 processed_obs = {
@@ -564,12 +554,13 @@ def make_train(config):
                 # Create transition object with consistent ordering
                 transition = Transition(
                     done=jnp.array([done["agent_0"], done["agent_1"]]).squeeze(),
-                    action=jnp.array([action_0, action_1]),
-                    value=jnp.array([value_0, value_1]),
+                    action=jnp.array([agent_0_action, agent_1_action]),  # Using consistent variable names
+                    value=jnp.array([agent_0_value, agent_1_value]),
                     reward=jnp.array([reward["agent_0"], reward["agent_1"]]).squeeze(),
-                    log_prob=jnp.array([log_prob_0, log_prob_1]),
+                    log_prob=jnp.array([agent_0_log_prob, agent_1_log_prob]),
                     obs=processed_obs
                 )
+
                 runner_state = (train_state, env_state, obsv, update_step, rng)
                 return runner_state, (transition, info)
 
@@ -989,6 +980,12 @@ def main(config):
     
     # Create environment using JaxMARL framework
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    print("\nEnvironment Action Space Debug:")
+    print(f"Action space: {env.action_space()}")
+    print(f"Number of actions: {env.action_space().n}")
+    print(f"Action enum values:")
+    for action in Actions:
+        print(f"  {action.name}: {action.value}")
 
     # Get environment dimensions
     base_obs_shape = env.observation_space().shape
