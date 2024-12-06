@@ -482,58 +482,40 @@ def make_train(config):
                 # Split RNG once for all operations in this step
                 rng, _rng = jax.random.split(rng)
 
-                # Process agent_1 first with zero action vector
-                print("\nAgent_1 shapes:")
-                print("Original agent_1 obs shape:", last_obs['agent_1'].shape)
-                agent_1_obs = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
-                print("agent_1 obs shape:", agent_1_obs.shape)
-                
-                # Create "no action" indicator (-1s instead of 0s) for agent_1's observation
-                # This makes it clear to the network that there is no action information
-                # rather than interpreting 0 as the "up" action
-                no_action_indicator = -1 * jnp.ones((last_obs['agent_1'].shape[0], env.action_space().n))
-                agent_1_obs_augmented = jnp.concatenate([agent_1_obs, no_action_indicator], axis=-1)
-                print("agent_1 augmented shape:", agent_1_obs_augmented.shape)
-                
-                # Get agent_1's action using shared parameters
-                agent_1_pi, agent_1_value = network.apply(train_state.params, agent_1_obs_augmented)
-                agent_1_action = agent_1_pi.sample(seed=_rng)
-                agent_1_log_prob = agent_1_pi.log_prob(agent_1_action)
-                
-                print("agent_1_value shape:", agent_1_value.shape)
-                print("agent_1 action shape:", agent_1_action.shape)
-                print("agent_1 log prob shape:", agent_1_log_prob.shape)
-
-                # Process agent_0 with agent_1's action
-                print("\nAgent_0 shapes:")
-                print("Original agent_0 obs shape:", last_obs['agent_0'].shape)
-                agent_0_obs = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
-                print("agent_0 obs shape:", agent_0_obs.shape)
-                
-                # Create one-hot encoding of agent_1's action
-                one_hot_action = jax.nn.one_hot(agent_1_action, env.action_space().n)
-                agent_0_obs_augmented = jnp.concatenate([agent_0_obs, one_hot_action], axis=-1)
-                print("agent_0_obs_augmented shape:", agent_0_obs_augmented.shape)
-                
-                # Get agent_0's action using shared parameters
-                agent_0_pi, agent_0_value = network.apply(train_state.params, agent_0_obs_augmented)
-                agent_0_action = agent_0_pi.sample(seed=_rng)
-                agent_0_log_prob = agent_0_pi.log_prob(agent_0_action)
-                
-                print("agent_0_value shape:", agent_0_value.shape)
-                print("agent_0_action_shape:", agent_0_action.shape)
-                print("agent_0_log_prob_shape:", agent_0_log_prob.shape)
-
-                # Store processed observations
-                processed_obs = {
-                    'agent_0': agent_0_obs_augmented,
-                    'agent_1': agent_1_obs_augmented
+                # Reshape observations properly handling batch dimension
+                obs_batch = {
+                    'agent_0': last_obs['agent_0'].reshape(config["NUM_ENVS"], -1),   # Shape: (NUM_ENVS, base_obs_dim)
+                    'agent_1': last_obs['agent_1'].reshape(config["NUM_ENVS"], -1),   # Shape: (NUM_ENVS, base_obs_dim)
                 }
 
-                # Package actions for environment step
+                # Create zero action vector with proper batch dimension
+                zero_action = jnp.zeros((config["NUM_ENVS"], env.action_space().n))  # Shape: (NUM_ENVS, action_dim)
+                
+                # Augment agent_1's observation
+                obs_batch['agent_1'] = jnp.concatenate([
+                    obs_batch['agent_1'],
+                    zero_action
+                ], axis=-1)  # Shape: (NUM_ENVS, base_obs_dim + action_dim)
+
+                # Get agent_1's action first using shared parameters
+                pi_1, value_1 = network.apply(train_state.params, obs_batch['agent_1'])
+                action_1 = pi_1.sample(seed=_rng)
+                
+                # Augment agent_0's observation with agent_1's action
+                one_hot_action = jax.nn.one_hot(action_1, env.action_space().n)  # Shape: (NUM_ENVS, action_dim)
+                obs_batch['agent_0'] = jnp.concatenate([
+                    obs_batch['agent_0'],
+                    one_hot_action
+                ], axis=-1)  # Shape: (NUM_ENVS, base_obs_dim + action_dim)
+                
+                # Get agent_0's action using shared parameters
+                pi_0, value_0 = network.apply(train_state.params, obs_batch['agent_0'])
+                action_0 = pi_0.sample(seed=_rng)
+
+                # Package actions and step environment
                 env_act = {
-                    "agent_0": agent_0_action,
-                    "agent_1": agent_1_action
+                    "agent_0": action_0,
+                    "agent_1": action_1
                 }
                 env_act = {k: v.flatten() for k, v in env_act.items()}
                 
@@ -565,11 +547,11 @@ def make_train(config):
                 # Create transition object with consistent ordering
                 transition = Transition(
                     done=jnp.array([done["agent_0"], done["agent_1"]]).squeeze(),
-                    action=jnp.array([agent_0_action, agent_1_action]),  # Using consistent variable names
-                    value=jnp.array([agent_0_value, agent_1_value]),
+                    action=jnp.array([action_0, action_1]),  # Using consistent variable names
+                    value=jnp.array([value_0, value_1]),
                     reward=jnp.array([reward["agent_0"], reward["agent_1"]]).squeeze(),
-                    log_prob=jnp.array([agent_0_log_prob, agent_1_log_prob]),
-                    obs=processed_obs
+                    log_prob=jnp.array([pi_0.log_prob(action_0), pi_1.log_prob(action_1)]),
+                    obs=obs_batch
                 )
 
                 runner_state = (train_state, env_state, obsv, update_step, rng)
@@ -583,8 +565,8 @@ def make_train(config):
             train_state, env_state, last_obs, update_step, rng = runner_state
             print("\nCalculating last values for both agents:")
             # First reshape the last observations
-            last_obs_agent1 = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
             last_obs_agent0 = last_obs['agent_0'].reshape(last_obs['agent_0'].shape[0], -1)
+            last_obs_agent1 = last_obs['agent_1'].reshape(last_obs['agent_1'].shape[0], -1)
 
             # Create zero action vector for agent_1's last value calculation
             zero_action = jnp.zeros((last_obs['agent_1'].shape[0], env.action_space().n))
@@ -605,7 +587,7 @@ def make_train(config):
             print("agent_0_last_val shape:", agent_0_last_val.shape)
 
             # Stack the last values in the same order as our transitions
-            last_val = jnp.array([agent_1_last_val, agent_0_last_val])
+            last_val = jnp.array([agent_0_last_val, agent_1_last_val])
             print("Combined last_val shape:", last_val.shape)
 
 
@@ -760,41 +742,40 @@ def make_train(config):
                                 - Total loss
                                 - Tuple of individual loss components
                         """
-                        # Process each agent observation separately
-                        pi0, value0 = network.apply(params, traj_batch.obs['agent_0'])
-                        pi1, value1 = network.apply(params, traj_batch.obs['agent_1'])
+                        # First process Agent 1 (acts without information)
+                        agent_1_obs = traj_batch.obs['agent_1'][..., :-env.action_space().n]  # Remove action part
+                        zero_actions = jnp.zeros_like(traj_batch.obs['agent_1'][..., -env.action_space().n:])
+                        agent_1_obs_augmented = jnp.concatenate([agent_1_obs, zero_actions], axis=-1)
+                        pi1, value1 = network.apply(params, agent_1_obs_augmented)
                         
-                        # Handle values - these can be stacked directly
-                        values = jnp.stack([value0, value1], axis=1)  # Shape: (batch_size, 2)
+                        # Then process Agent 0 (acts with Agent 1's action info)
+                        agent_0_obs = traj_batch.obs['agent_0'][..., :-env.action_space().n]  # Remove action part
+                        agent_1_actions = traj_batch.action[..., 0]  # Get Agent 1's actions
+                        one_hot_actions = jax.nn.one_hot(agent_1_actions, env.action_space().n)
+                        agent_0_obs_augmented = jnp.concatenate([agent_0_obs, one_hot_actions], axis=-1)
+                        pi0, value0 = network.apply(params, agent_0_obs_augmented)
                         
-                        # Calculate log probs for each agent separately
-                        log_prob0 = pi0.log_prob(traj_batch.action[:, 0])
-                        log_prob1 = pi1.log_prob(traj_batch.action[:, 1])
-                        log_probs = jnp.stack([log_prob0, log_prob1], axis=1)  # Shape: (batch_size, 2)
+                        # Rest of PPO remains nearly identical
+                        values = jnp.stack([value1, value0], axis=1)
+                        log_probs = jnp.stack([
+                            pi1.log_prob(traj_batch.action[..., 0]),
+                            pi0.log_prob(traj_batch.action[..., 1])
+                        ], axis=1)
                         
-                        # Value loss calculation
-                        value_pred_clipped = traj_batch.value + (
-                            values - traj_batch.value
-                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+                        # Standard PPO losses remain the same
+                        value_pred_clipped = traj_batch.value + (values - traj_batch.value).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
                         value_losses = jnp.square(values - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
                         value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
                         
-                        # Actor loss calculation
                         ratio = jnp.exp(log_probs - traj_batch.log_prob)
                         gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         loss_actor1 = ratio * gae
-                        loss_actor2 = jnp.clip(
-                            ratio,
-                            1.0 - config["CLIP_EPS"],
-                            1.0 + config["CLIP_EPS"]
-                        ) * gae
+                        loss_actor2 = jnp.clip(ratio, 1.0 - config["CLIP_EPS"], 1.0 + config["CLIP_EPS"]) * gae
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2).mean()
                         
-                        # Calculate entropy (average from both distributions)
                         entropy = (pi0.entropy().mean() + pi1.entropy().mean()) / 2
                         
-                        # Combine all losses
                         total_loss = (
                             loss_actor + 
                             config["VF_COEF"] * value_loss - 
