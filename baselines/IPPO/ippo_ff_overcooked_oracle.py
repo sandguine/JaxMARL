@@ -1,6 +1,9 @@
 """
 Implementation of Independent PPO (IPPO) for multi-agent environments.
 Based on PureJaxRL's PPO implementation but adapted for multi-agent scenarios.
+
+This version is for the overcooked environment with oracle knowledge of the other agent's action.
+What this means is that the principal agent has access to the other agent's action at each timestep.
 """
 
 # Core imports for JAX machine learning
