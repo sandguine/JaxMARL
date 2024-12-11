@@ -1,5 +1,7 @@
 """
 Based on PureJaxRL Implementation of PPO
+
+Adding a lot of debugging statements to trying to understand what is going on with the baseline IPPO implementation in Hanabi.
 """
 
 import jax
@@ -21,35 +23,105 @@ from omegaconf import OmegaConf
 
 
 class ActorCritic(nn.Module):
+    """
+    ActorCritic class for the Hanabi environment.
+
+    Attributes:
+        action_dim: Dimension of action space
+        config: Configuration dictionary
+    """
     action_dim: Sequence[int]
     config: Dict
 
+    def setup(self):
+        """
+        Initialize layers and activation functions.
+        This is automatically called when the model is initialized.
+        """
+        print("Setup method called")
+
+        # Embedding layer
+        self.embedding = nn.Dense(
+            512, 
+            kernel_init=orthogonal(np.sqrt(2)), 
+            bias_init=constant(0.0),
+            name="embedding"
+        )
+
+        # Actor layers
+        self.actor_dense1 = nn.Dense(
+            512, 
+            kernel_init=orthogonal(np.sqrt(2)), 
+            bias_init=constant(0.0),
+            name="actor_dense1"
+        )
+        self.actor_dense2 = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="actor_dense2"
+        )
+
+        # Critic layers
+        self.critic_dense1 = nn.Dense(
+            512, 
+            kernel_init=orthogonal(np.sqrt(2)), 
+            bias_init=constant(0.0),
+            name="critic_dense1"
+        )
+        self.critic_dense2 = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="critic_dense2"
+        )
+
     @nn.compact
     def __call__(self, x):
+         """
+        Forward pass of the ActorCritic network.
+
+        Args:
+            x: Input tuple containing observations, dones, and available actions
+
+        Returns:
+            Tuple containing policy distribution and value estimate
+        """
+        print("Network input x shape:", x.shape)
+        print("ActorCritic input shape:", x.shape)
+
+        # Extract input components
         obs, dones, avail_actions = x
-        embedding = nn.Dense(
-            512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(obs)
+
+        # Embedding layer
+        embedding = self.embedding(obs)
         embedding = nn.relu(embedding)
 
-        actor_mean = nn.Dense(512, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            embedding
-        )
+        # Actor layers
+        # First dense layer
+        actor_mean = self.actor_dense1(embedding)
+        # ReLU activation
         actor_mean = nn.relu(actor_mean)
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)
+        # Second dense layer
+        actor_mean = self.actor_dense2(actor_mean)
+        # ReLU activation
+        actor_mean = nn.relu(actor_mean)
+
+        # Unavailable actions
         unavail_actions = 1 - avail_actions
+        # Action logits
         action_logits = actor_mean - (unavail_actions * 1e10)
+        # Policy distribution
         pi = distrax.Categorical(logits=action_logits)
 
-        critic = nn.Dense(512, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            embedding
-        )
+        # Critic layers
+        critic = self.critic_dense1(embedding)
+        # ReLU activation
         critic = nn.relu(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
+        # Second dense layer
+        critic = self.critic_dense2(critic)
+        # ReLU activation
+        critic = nn.relu(critic)
 
         return pi, jnp.squeeze(critic, axis=-1)
 

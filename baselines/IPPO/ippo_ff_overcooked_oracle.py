@@ -47,6 +47,8 @@ class ActorCritic(nn.Module):
         """Initialize layers and activation function.
         This runs once when the model is created.
         """
+        print("Setup method called")
+
         # Store activation function
         self.act_fn = nn.relu if self.activation == "relu" else nn.tanh
 
